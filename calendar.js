@@ -539,8 +539,8 @@ function loadFullCalendar() {
 		initializeCalendar();
 	};
 	localScript.onerror = () => {
-		// No CDN fallback: script-src is 'self' (plus stats.convergent.tn),
-		// so an external CDN is blocked by CSP and only hides the real error.
+		// No CDN fallback: a typical script-src is 'self' only, so an external
+		// CDN is blocked by CSP and only hides the real error.
 		calError('could not load ?CalDavAsset/fullcalendar.min.js');
 	};
 	document.head.appendChild(localScript);
