@@ -276,6 +276,33 @@ cal.innerHTML = `
 		if (allDayCheck) allDayCheck.addEventListener('change', (e) => {
 			toggleTimeInputs(e.target.checked);
 		});
+
+		// Modal close buttons (override inline onclick)
+		const closeBtn = document.querySelector('.event-modal-close');
+		if (closeBtn) {
+			closeBtn.onclick = null; // Remove inline handler
+			closeBtn.addEventListener('click', () => {
+				document.getElementById('event-modal').classList.remove('show');
+			});
+		}
+
+		const cancelBtn = document.querySelector('.event-modal-btn-secondary');
+		if (cancelBtn) {
+			cancelBtn.onclick = null; // Remove inline handler
+			cancelBtn.addEventListener('click', () => {
+				document.getElementById('event-modal').classList.remove('show');
+			});
+		}
+
+		// Also close modal when clicking overlay
+		const modalOverlay = document.getElementById('event-modal');
+		if (modalOverlay) {
+			modalOverlay.addEventListener('click', (e) => {
+				if (e.target === modalOverlay) {
+					modalOverlay.classList.remove('show');
+				}
+			});
+		}
 	}, 100);
 
 	loadFullCalendar();
@@ -505,18 +532,42 @@ function hideCalendar() {
 }
 
 function loadFullCalendar() {
-	if (window.FullCalendar) { initializeFullCalendar(); return; }
-	
-	// Load FullCalendar bundle (includes CSS)
-	const script = document.createElement('script');
-	script.src = 'https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js';
-	script.onload = () => {
+	if (window.FullCalendar) { initializeCalendar(); return; }
+
+	// Try local copy first (more reliable)
+	const localScript = document.createElement('script');
+	// Find the plugin base URL from existing scripts
+	const pluginScripts = Array.from(document.scripts).filter(s => s.src && s.src.includes('caldav'));
+	let baseUrl;
+	if (pluginScripts.length > 0) {
+		baseUrl = pluginScripts[0].src.replace(/[^/]*$/, '');
+	} else {
+		// Fallback URL patterns for SnappyMail
+		const possiblePaths = [
+			'?/Plugins/caldav/',
+			'./plugins/caldav/',
+			'./data/_data_/_default_/plugins/caldav/'
+		];
+		baseUrl = possiblePaths[0]; // Try the most likely SnappyMail pattern first
+	}
+
+	localScript.src = baseUrl + 'fullcalendar.min.js';
+	localScript.onload = () => {
 		initializeCalendar();
 	};
-	script.onerror = () => {
-		document.getElementById('fc-calendar').innerHTML = '<div style="padding:40px;text-align:center;color:#999;">Failed to load calendar. Please refresh.</div>';
+	localScript.onerror = () => {
+		// Fallback to CDN
+		const cdnScript = document.createElement('script');
+		cdnScript.src = 'https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js';
+		cdnScript.onload = () => {
+			initializeCalendar();
+		};
+		cdnScript.onerror = () => {
+			document.getElementById('fc-calendar').innerHTML = '<div style="padding:40px;text-align:center;color:#999;">Failed to load calendar. Please refresh.</div>';
+		};
+		document.head.appendChild(cdnScript);
 	};
-	document.head.appendChild(script);
+	document.head.appendChild(localScript);
 }
 
 function initializeCalendar() {

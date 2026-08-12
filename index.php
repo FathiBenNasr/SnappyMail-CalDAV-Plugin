@@ -1,6 +1,6 @@
 <?php
 
-class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
+class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
@@ -21,7 +21,7 @@ class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
 		// Add JavaScript
 		$this->addJs('calendar.js');
 		$this->addJs('contacts-popover.js');
-		
+
 		// Add CSS
 		$this->addCss('calendar.css');
 	}
