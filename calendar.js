@@ -185,7 +185,7 @@ cal.innerHTML = `
 	<div class="event-modal">
 		<div class="event-modal-header">
 			<h2 class="event-modal-title" id="event-modal-title">New Event</h2>
-			<button class="event-modal-close" onclick="document.getElementById('event-modal').classList.remove('show')">×</button>
+			<button class="event-modal-close">×</button>
 		</div>
 		<div class="event-modal-body">
 			<form id="event-form">
@@ -234,7 +234,7 @@ cal.innerHTML = `
 		</div>
 		<div class="event-modal-footer">
 			<button class="event-modal-btn event-modal-btn-danger" id="event-delete-btn" style="display:none;">Delete</button>
-			<button class="event-modal-btn event-modal-btn-secondary" onclick="document.getElementById('event-modal').classList.remove('show')">Cancel</button>
+			<button class="event-modal-btn event-modal-btn-secondary">Cancel</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="event-save-btn">Save Event</button>
 		</div>
 	</div>
@@ -280,7 +280,6 @@ cal.innerHTML = `
 		// Modal close buttons (override inline onclick)
 		const closeBtn = document.querySelector('.event-modal-close');
 		if (closeBtn) {
-			closeBtn.onclick = null; // Remove inline handler
 			closeBtn.addEventListener('click', () => {
 				document.getElementById('event-modal').classList.remove('show');
 			});
@@ -288,7 +287,6 @@ cal.innerHTML = `
 
 		const cancelBtn = document.querySelector('.event-modal-btn-secondary');
 		if (cancelBtn) {
-			cancelBtn.onclick = null; // Remove inline handler
 			cancelBtn.addEventListener('click', () => {
 				document.getElementById('event-modal').classList.remove('show');
 			});
@@ -534,45 +532,32 @@ function hideCalendar() {
 function loadFullCalendar() {
 	if (window.FullCalendar) { initializeCalendar(); return; }
 
-	// Try local copy first (more reliable)
+	// Must go through the plugin's own part hook. "?/Plugins/caldav/<file>"
+	// looks right but ServicePlugins() ignores the path and returns the
+	// concatenated plugin bundle, so that URL silently loaded this script
+	// again and never defined window.FullCalendar.
 	const localScript = document.createElement('script');
-	// Find the plugin base URL from existing scripts
-	const pluginScripts = Array.from(document.scripts).filter(s => s.src && s.src.includes('caldav'));
-	let baseUrl;
-	if (pluginScripts.length > 0) {
-		baseUrl = pluginScripts[0].src.replace(/[^/]*$/, '');
-	} else {
-		// Fallback URL patterns for SnappyMail
-		const possiblePaths = [
-			'?/Plugins/caldav/',
-			'./plugins/caldav/',
-			'./data/_data_/_default_/plugins/caldav/'
-		];
-		baseUrl = possiblePaths[0]; // Try the most likely SnappyMail pattern first
-	}
-
-	localScript.src = baseUrl + 'fullcalendar.min.js';
+	localScript.src = '?CalDavAsset/fullcalendar.min.js';
 	localScript.onload = () => {
+		if (!window.FullCalendar) {
+			calError('fullcalendar.min.js loaded but did not define FullCalendar');
+			return;
+		}
 		initializeCalendar();
 	};
 	localScript.onerror = () => {
-		// Fallback to CDN
-		const cdnScript = document.createElement('script');
-		cdnScript.src = 'https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js';
-		cdnScript.onload = () => {
-			initializeCalendar();
-		};
-		cdnScript.onerror = () => {
-			document.getElementById('fc-calendar').innerHTML = '<div style="padding:40px;text-align:center;color:#999;">Failed to load calendar. Please refresh.</div>';
-		};
-		document.head.appendChild(cdnScript);
+		// No CDN fallback: script-src is 'self' (plus stats.convergent.tn),
+		// so an external CDN is blocked by CSP and only hides the real error.
+		calError('could not load ?CalDavAsset/fullcalendar.min.js');
 	};
 	document.head.appendChild(localScript);
 }
 
 function initializeCalendar() {
 const container = document.getElementById('fc-calendar');
-if (!container || !window.FullCalendar) return;
+if (!container) { calError('calendar container #fc-calendar missing'); return; }
+if (!window.FullCalendar) { calError('FullCalendar library did not load'); return; }
+try {
 
 calendar = new FullCalendar.Calendar(container, {
 initialView: 'dayGridMonth',
@@ -632,23 +617,24 @@ updateEvent(info.event);
 });
 
 calendar.render();
+} catch (e) {
+	calError('init failed: ' + (e && e.message ? e.message : e));
+}
 
 }
 
 function loadEventsFromCalDAV(successCallback, failureCallback) {
 
 if (!rl.pluginRemoteRequest) {
+calError('rl.pluginRemoteRequest unavailable - cannot reach the server');
 failureCallback({ message: 'Not available' });
 return;
 }
 
 rl.pluginRemoteRequest((iError, oData) => {
 if (iError || !oData || !oData.Result) {
-const statusEl = document.getElementById('sidebar-status');
-if (statusEl) {
-statusEl.textContent = 'Error';
-statusEl.style.color = '#f44336';
-}
+calError('server returned no events (error ' + iError + '): '
+	+ (oData && oData.ErrorMessage ? oData.ErrorMessage : JSON.stringify(oData)));
 successCallback([]);
 return;
 }

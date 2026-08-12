@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '1.0',
+		VERSION  = '1.4',
 		RELEASE  = '2025-11-12',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -18,6 +18,13 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('UpdateCalendarEvent', 'DoUpdateCalendarEvent');
 		$this->addJsonHook('DeleteCalendarEvent', 'DoDeleteCalendarEvent');
 		
+		// Serve this plugin's static assets. There is no built-in route for
+		// them: ServiceActions::ServicePlugins() ignores everything after
+		// /?/Plugins/ and always returns the compiled plugin JS bundle, so the
+		// old "?/Plugins/caldav/fullcalendar.min.js" URL returned this very
+		// file instead of the library and window.FullCalendar stayed undefined.
+		$this->addPartHook('CalDavAsset', 'ServiceCalDavAsset');
+
 		// Add JavaScript
 		$this->addJs('calendar.js');
 		$this->addJs('contacts-popover.js');
@@ -26,6 +33,33 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addCss('calendar.css');
 	}
 	
+	/**
+	 * Serve a whitelisted static file from this plugin directory.
+	 * URL: /?CalDavAsset/<name>
+	 */
+	public function ServiceCalDavAsset(...$aParts)
+	{
+		static $aAllowed = array(
+			'fullcalendar.min.js' => 'application/javascript; charset=utf-8'
+		);
+		$sName = isset($aParts[1]) ? \basename((string) $aParts[1]) : '';
+		if (!isset($aAllowed[$sName])) {
+			\MailSo\Base\Http::StatusHeader(404);
+			return true;
+		}
+		$sFile = __DIR__ . '/' . $sName;
+		if (!\is_readable($sFile)) {
+			\MailSo\Base\Http::StatusHeader(404);
+			return true;
+		}
+		$iMaxAge = 86400;
+		\header('Content-Type: ' . $aAllowed[$sName]);
+		\header("Cache-Control: max-age={$iMaxAge}, private");
+		\header('Content-Length: ' . \filesize($sFile));
+		echo \file_get_contents($sFile);
+		return true;
+	}
+
 	/**
 	 * Plugin configuration mapping
 	 */
@@ -36,12 +70,12 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				->SetLabel('CalDAV Server URL')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
 				->SetDescription('CalDAV server URL (e.g., https://my.mailbux.com/dav/cal)')
-				->SetDefaultValue('https://my.mailbux.com/dav/cal'),
+				->SetDefaultValue('https://pim.convergent.cc/dav/calendars/'),
 			\RainLoop\Plugins\Property::NewInstance('jmap_server')
 				->SetLabel('JMAP Server URL')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
 				->SetDescription('JMAP server URL (e.g., https://my.mailbux.com/jmap)')
-				->SetDefaultValue('https://my.mailbux.com/jmap'),
+				->SetDefaultValue('https://pim.convergent.cc/jmap'),
 			\RainLoop\Plugins\Property::NewInstance('default_protocol')
 				->SetLabel('Default Protocol')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::SELECTION)
@@ -81,15 +115,30 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			if ($mData && \is_string($mData)) {
 				$aCardDAVData = \json_decode($mData, true);
 				if (\is_array($aCardDAVData) && isset($aCardDAVData['User'], $aCardDAVData['Password'])) {
-					// Build CalDAV URL from CardDAV URL by replacing dav/card with dav/cal
-					$sCalDAVUrl = str_replace('/dav/card/', '/dav/cal/', $aCardDAVData['Url']);
-					// Remove /default suffix and let us add it ourselves
-					$sCalDAVUrl = rtrim(str_replace('/default', '', $sCalDAVUrl), '/');
-					
+					// Derive the CalDAV URL from the CardDAV one.
+					// Cyrus serves /dav/addressbooks/user/<u>/<collection> and
+					// /dav/calendars/user/<u>/<collection>; the old code only knew
+					// the /dav/card/ -> /dav/cal/ layout of another vendor, so on
+					// Cyrus it produced an addressbook URL and returned no events.
+					$sUrl = \rtrim($aCardDAVData['Url'], '/');
+					$sCollection = 'Default';
+					if (\preg_match('#/([^/]+)$#', $sUrl, $aM)) {
+						// Last path segment is the collection name; keep its case,
+						// Cyrus collection names are case sensitive in URLs.
+						$sCollection = $aM[1];
+						$sUrl = \substr($sUrl, 0, -\strlen($aM[0]));
+					}
+					$sCalDAVUrl = \str_replace(
+						array('/dav/addressbooks/', '/dav/card/'),
+						array('/dav/calendars/',   '/dav/cal/'),
+						$sUrl
+					);
+
 					return [
 						'User' => $aCardDAVData['User'],
 						'Password' => $aCardDAVData['Password'],
-						'CalDAVUrl' => $sCalDAVUrl
+						'CalDAVUrl' => \rtrim($sCalDAVUrl, '/'),
+						'Collection' => $sCollection
 					];
 				}
 			}
@@ -170,10 +219,95 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 	
 	/**
+	 * Parse one iCalendar object with Sabre VObject, expanding recurrences.
+	 * Returns null when VObject cannot handle the payload, so the caller falls
+	 * back to the original line-based parser.
+	 */
+	private function parseICalendarVObject($icalData)
+	{
+		if (!\class_exists('\\Sabre\\VObject\\Reader')) {
+			return null;
+		}
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($icalData, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VEVENT)) {
+				return null;
+			}
+
+			// Only recurring objects need expanding. Expanding everything would
+			// discard one-off events outside the window, and this calendar holds
+			// events from 2022 through 2038.
+			$bRecurring = false;
+			foreach ($oVCal->VEVENT as $oEvent) {
+				if (isset($oEvent->RRULE) || isset($oEvent->RDATE)) {
+					$bRecurring = true;
+					break;
+				}
+			}
+
+			$oSource = $oVCal;
+			if ($bRecurring) {
+				try {
+					$oSource = $oVCal->expand(new \DateTime('-1 year'), new \DateTime('+2 years'));
+				} catch (\Throwable $e) {
+					// No instances in the window, or a rule VObject refuses to
+					// expand: fall back to the unexpanded object.
+					$oSource = $oVCal;
+				}
+			}
+
+			$aResult = [];
+			// expand() drops the property entirely when a series has no
+			// instance inside the window; iterating that would warn in PHP 8.
+			if (!isset($oSource->VEVENT)) {
+				return $aResult;
+			}
+			foreach ($oSource->VEVENT as $oEvent) {
+				$oDtStart = $oEvent->DTSTART ?? null;
+				if (!$oDtStart) {
+					continue;
+				}
+				$bAllDay = !$oDtStart->hasTime();
+				$oEnd = $oEvent->DTEND ?? null;
+				if (!$oEnd && isset($oEvent->DURATION)) {
+					$oEndDt = $oDtStart->getDateTime();
+					$oEndDt = $oEndDt->add(\Sabre\VObject\DateTimeParser::parseDuration((string) $oEvent->DURATION));
+				} else {
+					$oEndDt = $oEnd ? $oEnd->getDateTime() : $oDtStart->getDateTime();
+				}
+				$sFmt = $bAllDay ? 'Y-m-d' : 'c';
+				$aResult[] = [
+					'uid'         => (string) ($oEvent->UID ?? ''),
+					'summary'     => (string) ($oEvent->SUMMARY ?? 'Untitled'),
+					'dtstart'     => $oDtStart->getDateTime()->format($sFmt),
+					'dtend'       => $oEndDt->format($sFmt),
+					'description' => (string) ($oEvent->DESCRIPTION ?? ''),
+					'location'    => (string) ($oEvent->LOCATION ?? ''),
+					'allDay'      => $bAllDay
+				];
+			}
+			return $aResult;
+		} catch (\Throwable $e) {
+			\SnappyMail\Log::notice('CalDAV', 'VObject parse failed: ' . $e->getMessage());
+			return null;
+		}
+	}
+
+	/**
 	 * Parse iCalendar data
 	 */
 	private function parseICalendar($icalData)
 	{
+		// SnappyMail bundles Sabre VObject 4.5.2; use it in preference to the
+		// hand-rolled reader below. It unfolds continuation lines (65 of the
+		// 109 stored events use them), resolves VTIMEZONE, and expands RRULE.
+		// Without expansion a yearly event created in 2022 is only ever
+		// returned for 2022, which is why most of the calendar looked empty.
+		$aEvents = $this->parseICalendarVObject($icalData);
+		if (null !== $aEvents) {
+			return $aEvents;
+		}
+
 		$events = [];
 		
 		// Simple iCalendar parser
@@ -263,7 +397,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			}
 			
 			// Build CalDAV URL
-			$sCalDAVUrl = $aConfig['CalDAVUrl'] . '/default/';
+			$sCalDAVUrl = $aConfig['CalDAVUrl'] . '/' . ($aConfig['Collection'] ?? 'Default') . '/';
 			
 			
 			// CalDAV REPORT query for events
@@ -398,7 +532,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sICS .= "END:VCALENDAR\r\n";
 			
 			// PUT event to CalDAV server
-			$sEventUrl = $aConfig['CalDAVUrl'] . '/default/' . $sUid . '.ics';
+			$sEventUrl = $aConfig['CalDAVUrl'] . '/' . ($aConfig['Collection'] ?? 'Default') . '/' . $sUid . '.ics';
 			
 			
 			$result = $this->makeCalDAVRequest(
@@ -492,7 +626,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			}
 			
 			// PUT updated event
-			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/default/' . $sEventId . '.ics';
+			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default') . '/' . $sEventId . '.ics';
 			
 			$result = $this->makeCalDAVRequest(
 				$sEventUrl,
@@ -550,7 +684,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			
 			// DELETE event from CalDAV server
 			// URL-encode the event ID to handle @ symbols properly
-			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/default/' . rawurlencode($sEventId) . '.ics';
+			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default') . '/' . rawurlencode($sEventId) . '.ics';
 			
 			
 			$result = $this->makeCalDAVRequest(
