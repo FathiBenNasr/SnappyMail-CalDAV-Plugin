@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '1.5',
+		VERSION  = '1.6',
 		RELEASE  = '2025-11-12',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -66,16 +66,32 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	protected function configMapping() : array
 	{
 		return array(
-			\RainLoop\Plugins\Property::NewInstance('caldav_server')
-				->SetLabel('CalDAV Server URL')
+			\RainLoop\Plugins\Property::NewInstance('caldav_url_template')
+				->SetLabel('CalDAV URL template')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
-				->SetDescription('CalDAV server URL (e.g., https://my.mailbux.com/dav/cal)')
-				->SetDefaultValue('https://pim.convergent.cc/dav/calendars/'),
+				->SetDescription('Calendar collection URL for this server, e.g.'
+					. ' https://dav.example.com/dav/calendars/user/{user}/Default'
+					. ' - {user} = mailbox name as the DAV server knows it, {email} = full address,'
+					. ' {login} = local part, {domain} = domain part. Leave empty to derive it from'
+					. ' the CardDAV plugin settings instead.')
+				->SetDefaultValue(''),
+			\RainLoop\Plugins\Property::NewInstance('dav_default_domain')
+				->SetLabel('DAV default domain')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
+				->SetDescription('Addresses in this domain are addressed by local part only,'
+					. ' everything else by full address. Leave empty to always use the full address.')
+				->SetDefaultValue(''),
+			\RainLoop\Plugins\Property::NewInstance('caldav_server')
+				->SetLabel('CalDAV Server URL (legacy)')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
+				->SetDescription('Unused when a CalDAV URL template is set. Kept so existing'
+					. ' configurations keep loading.')
+				->SetDefaultValue(''),
 			\RainLoop\Plugins\Property::NewInstance('jmap_server')
 				->SetLabel('JMAP Server URL')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
-				->SetDescription('JMAP server URL (e.g., https://my.mailbux.com/jmap)')
-				->SetDefaultValue('https://pim.convergent.cc/jmap'),
+				->SetDescription('JMAP server URL, e.g. https://dav.example.com/jmap')
+				->SetDefaultValue(''),
 			\RainLoop\Plugins\Property::NewInstance('default_protocol')
 				->SetLabel('Default Protocol')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::SELECTION)
@@ -115,6 +131,26 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			if ($mData && \is_string($mData)) {
 				$aCardDAVData = \json_decode($mData, true);
 				if (\is_array($aCardDAVData) && isset($aCardDAVData['User'], $aCardDAVData['Password'])) {
+					// The plugin's own setting wins: the calendar URL belongs to the
+					// deployment and should come from the settings page, not be
+					// inferred. Deriving from CardDAV stays as the fallback so
+					// existing installs keep working without reconfiguration.
+					$sTemplate = \trim($this->Config()->Get('plugin', 'caldav_url_template', ''));
+					if (\strlen($sTemplate)) {
+						$sUrl = \rtrim($this->expandDavTemplate($sTemplate, $aCardDAVData['User']), '/');
+						$sCollection = 'Default';
+						if (\preg_match('#/([^/]+)$#', $sUrl, $aM)) {
+							$sCollection = $aM[1];
+							$sUrl = \substr($sUrl, 0, -\strlen($aM[0]));
+						}
+						return [
+							'User' => $aCardDAVData['User'],
+							'Password' => $aCardDAVData['Password'],
+							'CalDAVUrl' => \rtrim($sUrl, '/'),
+							'Collection' => $sCollection
+						];
+					}
+
 					// Derive the CalDAV URL from the CardDAV one.
 					// Cyrus serves /dav/addressbooks/user/<u>/<collection> and
 					// /dav/calendars/user/<u>/<collection>; the old code only knew
@@ -218,6 +254,24 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		];
 	}
 	
+	/**
+	 * Expand {user}/{email}/{login}/{domain} in a configured DAV URL.
+	 */
+	private function expandDavTemplate(string $sTemplate, string $sEmail) : string
+	{
+		$sDefaultDomain = \strtolower(\trim($this->Config()->Get('plugin', 'dav_default_domain', '')));
+		$aParts = \explode('@', $sEmail, 2);
+		$sLogin = $aParts[0];
+		$sDomain = $aParts[1] ?? '';
+		$sUser = ($sDefaultDomain && \strtolower($sDomain) === $sDefaultDomain) ? $sLogin : $sEmail;
+		return \strtr($sTemplate, array(
+			'{user}'   => $sUser,
+			'{email}'  => $sEmail,
+			'{login}'  => $sLogin,
+			'{domain}' => $sDomain
+		));
+	}
+
 	/**
 	 * Collect VALARM trigger times for one event as absolute ISO-8601 stamps.
 	 *
