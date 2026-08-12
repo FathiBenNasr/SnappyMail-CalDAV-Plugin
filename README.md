@@ -68,6 +68,12 @@ Admin → Plugins → caldav:
 Leave the template empty to derive the calendar URL from the CardDAV plugin
 settings instead.
 
+## Authors
+
+* Original plugin — **Mailbux** ([mailbux.com](https://mailbux.com)), see `LICENSE`
+* Fork maintainer — **Fathi Ben Nasr** <fbennasr@convergent.tn>,
+  [Convergent Cloud Computing](https://www.convergent.tn)
+
 ## Credits and licence
 
 Original plugin © 2025 Mailbux — see `LICENSE`. This fork keeps that licence and

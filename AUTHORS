@@ -1,0 +1,13 @@
+Original plugin
+---------------
+Mailbux — https://mailbux.com
+  SnappyMail CalDAV Auto, released 2025-11-12 under the terms in LICENSE.
+  Upstream repository: https://github.com/mailwish/SnappyMail-CalDAV-Plugin
+
+Fork maintainer
+---------------
+Fathi Ben Nasr <fbennasr@convergent.tn>
+  Convergent Cloud Computing — https://www.convergent.tn
+  Adaptations for standards compliance and interoperability with the
+  Cyrus IMAP CalDAV implementation. See the commit history and README
+  for the specific changes.
