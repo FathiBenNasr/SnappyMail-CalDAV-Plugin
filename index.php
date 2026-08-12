@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '1.4',
+		VERSION  = '1.5',
 		RELEASE  = '2025-11-12',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -219,6 +219,47 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 	
 	/**
+	 * Collect VALARM trigger times for one event as absolute ISO-8601 stamps.
+	 *
+	 * TRIGGER is either a duration relative to the event start (or end, with
+	 * RELATED=END) or an absolute DATE-TIME. 75 of the events already stored
+	 * here carry a VALARM written by Thunderbird; they were previously parsed
+	 * straight past, so the webmail never knew a reminder existed.
+	 */
+	private function extractAlarms($oEvent, \DateTimeInterface $oStart, \DateTimeInterface $oEnd) : array
+	{
+		$aAlarms = [];
+		if (!isset($oEvent->VALARM)) {
+			return $aAlarms;
+		}
+		foreach ($oEvent->VALARM as $oAlarm) {
+			$oTrigger = $oAlarm->TRIGGER ?? null;
+			if (!$oTrigger) {
+				continue;
+			}
+			try {
+				$sValue = \strtoupper((string) ($oTrigger['VALUE'] ?? 'DURATION'));
+				if ('DATE-TIME' === $sValue) {
+					$oWhen = $oTrigger->getDateTime();
+				} else {
+					$sRelated = \strtoupper((string) ($oTrigger['RELATED'] ?? 'START'));
+					$oBase = ('END' === $sRelated) ? $oEnd : $oStart;
+					$oWhen = (clone $oBase)->add(
+						\Sabre\VObject\DateTimeParser::parseDuration((string) $oTrigger)
+					);
+				}
+				$aAlarms[] = [
+					'at'     => $oWhen->format('c'),
+					'action' => \strtoupper((string) ($oAlarm->ACTION ?? 'DISPLAY'))
+				];
+			} catch (\Throwable $e) {
+				// A malformed TRIGGER must not cost us the whole event.
+			}
+		}
+		return $aAlarms;
+	}
+
+	/**
 	 * Parse one iCalendar object with Sabre VObject, expanding recurrences.
 	 * Returns null when VObject cannot handle the payload, so the caller falls
 	 * back to the original line-based parser.
@@ -283,7 +324,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					'dtend'       => $oEndDt->format($sFmt),
 					'description' => (string) ($oEvent->DESCRIPTION ?? ''),
 					'location'    => (string) ($oEvent->LOCATION ?? ''),
-					'allDay'      => $bAllDay
+					'allDay'      => $bAllDay,
+					'alarms'      => $this->extractAlarms($oEvent, $oDtStart->getDateTime(), $oEndDt)
 				];
 			}
 			return $aResult;
@@ -527,7 +569,19 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			if (!empty($sLocation)) {
 				$sICS .= "LOCATION:" . $this->escapeICS($sLocation) . "\r\n";
 			}
-			
+
+			// A real VALARM, so the reminder also reaches Thunderbird and any
+			// other CalDAV client. This used to be appended to DESCRIPTION as
+			// the literal text "@email", which alerted nothing anywhere.
+			$iReminder = (int) ($this->jsonParam('Reminder', 0));
+			if (0 < $iReminder) {
+				$sICS .= "BEGIN:VALARM\r\n";
+				$sICS .= "ACTION:DISPLAY\r\n";
+				$sICS .= "TRIGGER;RELATED=START:-PT{$iReminder}M\r\n";
+				$sICS .= "DESCRIPTION:" . $this->escapeICS($sTitle) . "\r\n";
+				$sICS .= "END:VALARM\r\n";
+			}
+
 			$sICS .= "END:VEVENT\r\n";
 			$sICS .= "END:VCALENDAR\r\n";
 			

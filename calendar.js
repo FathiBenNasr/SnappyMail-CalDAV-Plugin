@@ -448,13 +448,6 @@ function saveEventFromModal() {
 		return;
 	}
 	
-	// Add @email marker for Stalwart email notifications
-	if (reminder && description) {
-		description += '\n@email';
-	} else if (reminder) {
-		description = '@email';
-	}
-	
 	// Parse dates correctly based on allDay
 	let startDate, endDate;
 	if (allDay) {
@@ -656,9 +649,100 @@ return;
 	});
 
 	calendarEvents = events;
-	
+	scheduleReminders(result.events || []);
+
 	successCallback(events);
 }, 'GetCalendarEvents', {});
+}
+
+/* ------------------------------------------------------------------ *
+ * Reminders (VALARM -> Notification API)
+ *
+ * The stored events already carry VALARMs written by other clients; the
+ * server now returns each one resolved to an absolute time. Alarms already
+ * due for an event that has not started yet fire on connect (that is the
+ * "you just logged in and something is coming up" case); the rest are armed
+ * with setTimeout for as long as the tab stays open.
+ * ------------------------------------------------------------------ */
+const REMINDER_SEEN_KEY = 'caldav-reminders-fired';
+const REMINDER_ARM_WINDOW_MS = 24 * 3600 * 1000;
+let reminderTimers = [];
+
+function reminderSeen() {
+	try { return new Set(JSON.parse(localStorage.getItem(REMINDER_SEEN_KEY) || '[]')); }
+	catch (e) { return new Set(); }
+}
+
+function markReminderSeen(key) {
+	try {
+		const seen = reminderSeen();
+		seen.add(key);
+		// keep it from growing without bound
+		const arr = Array.from(seen).slice(-500);
+		localStorage.setItem(REMINDER_SEEN_KEY, JSON.stringify(arr));
+	} catch (e) { /* private mode: just re-notify next time */ }
+}
+
+function showReminder(ev, when) {
+	const key = (ev.uid || ev.summary) + '@' + when;
+	if (reminderSeen().has(key)) return;
+	markReminderSeen(key);
+
+	const start = new Date(ev.dtstart || ev.start);
+	const body = (ev.allDay ? start.toLocaleDateString() : start.toLocaleString())
+		+ (ev.location ? '\n' + ev.location : '');
+	if (window.Notification && Notification.permission === 'granted') {
+		try {
+			new Notification(ev.summary || 'Event', { body: body, tag: key });
+			return;
+		} catch (e) { /* fall through to the in-page banner */ }
+	}
+	showReminderBanner(ev.summary || 'Event', body);
+}
+
+function showReminderBanner(title, body) {
+	let host = document.getElementById('cal-reminder-host');
+	if (!host) {
+		host = document.createElement('div');
+		host.id = 'cal-reminder-host';
+		host.style.cssText = 'position:fixed;top:16px;right:16px;z-index:20000;display:flex;'
+			+ 'flex-direction:column;gap:8px;max-width:320px;';
+		document.body.appendChild(host);
+	}
+	const el = document.createElement('div');
+	el.style.cssText = 'background:var(--cal-bg-primary,#fff);color:var(--cal-text-primary,#1a1a1a);'
+		+ 'border-left:4px solid var(--cal-accent,#00639a);border-radius:8px;padding:12px 14px;'
+		+ 'box-shadow:0 4px 16px rgba(0,0,0,.2);font-size:13px;cursor:pointer;white-space:pre-line;';
+	el.textContent = '\u23F0 ' + title + '\n' + body;
+	el.addEventListener('click', () => el.remove());
+	host.appendChild(el);
+	setTimeout(() => el.remove(), 30000);
+}
+
+function scheduleReminders(events) {
+	reminderTimers.forEach(clearTimeout);
+	reminderTimers = [];
+
+	if (window.Notification && Notification.permission === 'default') {
+		// Must be user-initiated in Firefox; opening the calendar counts.
+		try { Notification.requestPermission(); } catch (e) { /* ignore */ }
+	}
+
+	const now = Date.now();
+	events.forEach(ev => {
+		const startMs = new Date(ev.dtstart || ev.start).getTime();
+		if (!startMs || startMs < now) return;          // event already began
+		(ev.alarms || []).forEach(al => {
+			const at = new Date(al.at).getTime();
+			if (!at) return;
+			const delta = at - now;
+			if (delta <= 0) {
+				showReminder(ev, al.at);                 // due while we were away
+			} else if (delta <= REMINDER_ARM_WINDOW_MS) {
+				reminderTimers.push(setTimeout(() => showReminder(ev, al.at), delta));
+			}
+		});
+	});
 }
 
 function createEvent(eventData) {
@@ -683,7 +767,9 @@ function createEvent(eventData) {
 			: eventData.end.toISOString(),
 		AllDay: eventData.allDay || false,
 		Description: eventData.description || '',
-		Location: eventData.location || ''
+		Location: eventData.location || '',
+		// minutes before start; the server turns this into a real VALARM
+		Reminder: eventData.reminder || 0
 	});
 }
 
