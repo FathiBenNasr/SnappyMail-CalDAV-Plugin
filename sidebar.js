@@ -25,6 +25,18 @@ addEventListener('rl-view-model.create', e => {
 		if (!toolbar || toolbar.querySelector('.buttonCalendar')) return;
 
 		view.calendarClick = () => {
+			// Browsers only honour a permission request made from inside a
+			// running user-gesture handler; asking at page load is rejected
+			// outright ("may only be requested from inside a short running
+			// user-generated event handler"), which left reminders unable to
+			// notify at all. This click is such a handler.
+			if (window.Notification && 'default' === Notification.permission) {
+				try {
+					Notification.requestPermission();
+				} catch (err) {
+					console.error('[caldav sidebar] notification permission:', err);
+				}
+			}
 			window.location.hash = '#/calendar';
 		};
 

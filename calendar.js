@@ -723,11 +723,6 @@ function scheduleReminders(events) {
 	reminderTimers.forEach(clearTimeout);
 	reminderTimers = [];
 
-	if (window.Notification && Notification.permission === 'default') {
-		// Must be user-initiated in Firefox; opening the calendar counts.
-		try { Notification.requestPermission(); } catch (e) { /* ignore */ }
-	}
-
 	const now = Date.now();
 	events.forEach(ev => {
 		const startMs = new Date(ev.dtstart || ev.start).getTime();
