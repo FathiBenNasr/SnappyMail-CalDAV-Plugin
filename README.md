@@ -56,6 +56,22 @@ so other CalDAV clients honour them too.
 **Failures are reported.** Every error path returned silently, which is why a
 broken calendar was indistinguishable from an empty one. They now report.
 
+## Inviting people
+
+The event dialog has an **Invite** field taking one or more addresses, separated
+by commas or semicolons, in either `name@example.com` or `Name <name@example.com>`
+form. Saving the event adds an `ORGANIZER` and one `ATTENDEE` per address.
+
+The invitations are **not** built or sent by this plugin. Under
+[RFC 6638](https://www.rfc-editor.org/rfc/rfc6638) the CalDAV server owns
+scheduling: it sees the attendees on the stored event, mails each of them, and
+marks them with `SCHEDULE-STATUS`. Verified against Cyrus IMAP, which returns
+`SCHEDULE-STATUS=1.1` for a dispatched invitation. This requires scheduling to
+be enabled on the server - on Cyrus that is `caldav_allowscheduling`, with
+`imipnotifier` for delivery by mail.
+
+Replies update the attendee list as the participants answer.
+
 ## Configuration
 
 Admin → Plugins → caldav:

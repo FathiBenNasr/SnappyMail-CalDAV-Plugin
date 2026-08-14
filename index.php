@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '1.8',
+		VERSION  = '1.9',
 		RELEASE  = '2025-11-12',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -36,6 +36,49 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addCss('calendar.css');
 	}
 	
+	/**
+	 * The invited addresses of an event, as a display string. The organiser is
+	 * left out: they are not an invitee of their own meeting.
+	 */
+	private function listAttendees($oEvent) : string
+	{
+		if (!isset($oEvent->ATTENDEE)) {
+			return '';
+		}
+		$sOrganizer = \strtolower(\preg_replace('#^mailto:#i', '',
+			\trim((string) ($oEvent->ORGANIZER ?? ''))));
+		$aResult = array();
+		foreach ($oEvent->ATTENDEE as $oAttendee) {
+			$sAddr = \preg_replace('#^mailto:#i', '', \trim((string) $oAttendee));
+			if (\strlen($sAddr) && \strtolower($sAddr) !== $sOrganizer) {
+				$aResult[\strtolower($sAddr)] = $sAddr;
+			}
+		}
+		return \implode(', ', $aResult);
+	}
+
+	/**
+	 * Split a free-text recipient list into deliverable addresses.
+	 * Accepts commas or semicolons, and "Name <a@b>" as well as a bare address.
+	 */
+	private function parseAttendees(string $sList) : array
+	{
+		$aResult = array();
+		foreach (\preg_split('/[,;]+/', $sList) as $sPart) {
+			$sPart = \trim($sPart);
+			if (!\strlen($sPart)) {
+				continue;
+			}
+			if (\preg_match('/<([^>]+)>/', $sPart, $aMatch)) {
+				$sPart = \trim($aMatch[1]);
+			}
+			if (\filter_var($sPart, \FILTER_VALIDATE_EMAIL)) {
+				$aResult[\strtolower($sPart)] = $sPart;
+			}
+		}
+		return \array_values($aResult);
+	}
+
 	/**
 	 * Serve a whitelisted static file from this plugin directory.
 	 * URL: /?CalDavAsset/<name>
@@ -382,6 +425,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					'description' => (string) ($oEvent->DESCRIPTION ?? ''),
 					'location'    => (string) ($oEvent->LOCATION ?? ''),
 					'allDay'      => $bAllDay,
+					'attendees'   => $this->listAttendees($oEvent),
 					'alarms'      => $this->extractAlarms($oEvent, $oDtStart->getDateTime(), $oEndDt)
 				];
 			}
@@ -582,6 +626,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$bAllDay = $this->jsonParam('AllDay', false);
 			$sDescription = $this->jsonParam('Description', '');
 			$sLocation = $this->jsonParam('Location', '');
+			$sAttendees = (string) $this->jsonParam('Attendees', '');
 			
 			
 			if (empty($sTitle)) {
@@ -625,6 +670,27 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			}
 			if (!empty($sLocation)) {
 				$sICS .= "LOCATION:" . $this->escapeICS($sLocation) . "\r\n";
+			}
+
+			// Inviting someone turns this into a scheduling object: it needs an
+			// ORGANIZER, and each ATTENDEE needs RSVP so clients know to ask.
+			// The invitations themselves are not built or sent here - under
+			// RFC 6638 the CalDAV server does that when it sees the ATTENDEEs,
+			// and marks each one with SCHEDULE-STATUS. Verified against Cyrus.
+			$aAttendees = $this->parseAttendees($sAttendees);
+			if ($aAttendees) {
+				$sSelf = $oAccount->Email();
+				$sICS .= 'ORGANIZER;CN=' . $this->escapeICS($oAccount->Name() ?: $sSelf)
+					. ':mailto:' . $sSelf . "\r\n";
+				// The organiser attends their own meeting.
+				$sICS .= 'ATTENDEE;CN=' . $this->escapeICS($oAccount->Name() ?: $sSelf)
+					. ';PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:' . $sSelf . "\r\n";
+				foreach ($aAttendees as $sAttendee) {
+					if (\strcasecmp($sAttendee, $sSelf)) {
+						$sICS .= 'ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;'
+							. 'ROLE=REQ-PARTICIPANT:mailto:' . $sAttendee . "\r\n";
+					}
+				}
 			}
 
 			// A real VALARM, so the reminder also reaches Thunderbird and any

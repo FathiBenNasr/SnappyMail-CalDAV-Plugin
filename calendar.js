@@ -214,6 +214,11 @@ cal.innerHTML = `
 					<input type="text" class="event-form-input" id="event-location" placeholder="Add location">
 				</div>
 				<div class="event-form-group">
+					<label class="event-form-label">Invite</label>
+					<input type="text" class="event-form-input" id="event-attendees" placeholder="email@example.com, another@example.com">
+					<small style="opacity:.7">Invitations are sent by the calendar server once the event is saved.</small>
+				</div>
+				<div class="event-form-group">
 					<label class="event-form-label">Description</label>
 					<textarea class="event-form-textarea" id="event-description" placeholder="Add description"></textarea>
 				</div>
@@ -340,6 +345,8 @@ function openEventModal(eventData = null, fcEvent = null) {
 		document.getElementById('event-location').value = eventData.location || '';
 		document.getElementById('event-description').value = eventData.description || '';
 		document.getElementById('event-reminder').value = eventData.reminder || '';
+		const att = document.getElementById('event-attendees');
+		if (att) att.value = eventData.attendees || '';
 		
 		// Set date/time values based on allDay status
 		if (isAllDay) {
@@ -442,6 +449,7 @@ function saveEventFromModal() {
 	const location = document.getElementById('event-location').value.trim();
 	let description = document.getElementById('event-description').value.trim();
 	const reminder = document.getElementById('event-reminder').value;
+	const attendees = (document.getElementById('event-attendees') || {}).value || '';
 	
 	if (!title || !start || !end) {
 		alert('Please fill in all required fields');
@@ -472,7 +480,8 @@ function saveEventFromModal() {
 		allDay,
 		location,
 		description,
-		reminder: parseInt(reminder) || 0
+		reminder: parseInt(reminder) || 0,
+		attendees: attendees
 	};
 	
 	if (currentEditingEvent) {
@@ -587,7 +596,8 @@ eventClick: function(info) {
 		allDay: event.allDay,
 		location: event.extendedProps?.location || '',
 		description: event.extendedProps?.description || '',
-		reminder: event.extendedProps?.reminder || ''
+		reminder: event.extendedProps?.reminder || '',
+		attendees: event.extendedProps?.attendees || ''
 	}, event);
 },
 
@@ -644,7 +654,12 @@ return;
 			backgroundColor: 'var(--cal-event-bg)',
 			borderColor: 'var(--cal-event-border)',
 			textColor: 'var(--cal-event-text)',
-			classNames: ['modern-event']
+			classNames: ['modern-event'],
+			extendedProps: {
+				location: event.location || '',
+				description: event.description || '',
+				attendees: event.attendees || ''
+			}
 		};
 	});
 
@@ -764,7 +779,9 @@ function createEvent(eventData) {
 		Description: eventData.description || '',
 		Location: eventData.location || '',
 		// minutes before start; the server turns this into a real VALARM
-		Reminder: eventData.reminder || 0
+		Reminder: eventData.reminder || 0,
+		// comma or semicolon separated; the calendar server mails the invitations
+		Attendees: eventData.attendees || ''
 	});
 }
 
