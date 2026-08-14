@@ -490,6 +490,9 @@ function saveEventFromModal() {
 		currentEditingEvent.setStart(eventData.start);
 		currentEditingEvent.setEnd(eventData.end);
 		currentEditingEvent.setAllDay(allDay);
+		currentEditingEvent.setExtendedProp('attendees', eventData.attendees || '');
+		currentEditingEvent.setExtendedProp('location', eventData.location || '');
+		currentEditingEvent.setExtendedProp('description', eventData.description || '');
 		updateEvent(currentEditingEvent);
 	} else {
 		// Create new event
@@ -821,6 +824,9 @@ function updateEvent(event) {
 		}
 		if (calendar) calendar.refetchEvents();
 	}, 'UpdateCalendarEvent', {
+		// omitted when unknown: the server only rewrites the guest list when
+		// this is present, so dragging an event cannot uninvite anyone
+		Attendees: event.extendedProps?.attendees,
 		EventId: eventId,
 		Title: event.title,
 		Start: startFormatted,

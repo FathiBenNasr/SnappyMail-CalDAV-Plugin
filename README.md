@@ -72,6 +72,10 @@ be enabled on the server - on Cyrus that is `caldav_allowscheduling`, with
 
 Replies update the attendee list as the participants answer.
 
+Editing a saved event re-sends the guest list, so adding or removing someone
+invites or uninvites them. `SEQUENCE` is advanced whenever the time or the guest
+list changes, which is what tells the attendees' clients to accept the update.
+
 ## Configuration
 
 Admin → Plugins → caldav:
