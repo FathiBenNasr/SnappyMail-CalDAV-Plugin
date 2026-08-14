@@ -504,17 +504,35 @@ function hideCalendar() {
 	});
 }
 
+function calendarLoadFailed(message) {
+	console.error('[caldav] ' + message);
+	const el = document.getElementById('fc-calendar');
+	if (el) {
+		el.innerHTML = '<div style="padding:40px;text-align:center;color:#999;">'
+			+ message + '</div>';
+	}
+}
+
 function loadFullCalendar() {
-	if (window.FullCalendar) { initializeFullCalendar(); return; }
+	if (window.FullCalendar) { initializeCalendar(); return; }
 	
 	// Load FullCalendar bundle (includes CSS)
 	const script = document.createElement('script');
 	script.src = 'https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js';
 	script.onload = () => {
+		// A Content-Security-Policy that omits the CDN blocks execution while
+		// still firing onload, so the global has to be checked rather than
+		// assumed - otherwise initializeCalendar() returns silently and the
+		// calendar stays empty with nothing reported.
+		if (!window.FullCalendar) {
+			calendarLoadFailed('FullCalendar did not load. If the site sets a'
+				+ ' Content-Security-Policy, cdn.jsdelivr.net must be allowed in script-src.');
+			return;
+		}
 		initializeCalendar();
 	};
 	script.onerror = () => {
-		document.getElementById('fc-calendar').innerHTML = '<div style="padding:40px;text-align:center;color:#999;">Failed to load calendar. Please refresh.</div>';
+		calendarLoadFailed('Failed to load calendar. Please refresh.');
 	};
 	document.head.appendChild(script);
 }
