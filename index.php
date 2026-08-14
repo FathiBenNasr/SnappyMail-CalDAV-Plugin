@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '1.6',
+		VERSION  = '1.7',
 		RELEASE  = '2025-11-12',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -27,7 +27,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 
 		// Add JavaScript
 		$this->addJs('calendar.js');
-		$this->addJs('contacts-popover.js');
+		// Replaces contacts-popover.js, which reached the calendar by hijacking
+		// the Contacts button. contacts-popover.js is kept in the tree for
+		// reference but is no longer loaded.
+		$this->addJs('sidebar.js');
 
 		// Add CSS
 		$this->addCss('calendar.css');
