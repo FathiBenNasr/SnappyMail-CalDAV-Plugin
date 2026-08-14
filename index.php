@@ -103,6 +103,54 @@ class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
 	/**
 	 * Make CalDAV request
 	 */
+	/**
+	 * Apply the dialog's changes to the stored event, keeping everything the
+	 * dialog does not know about. Returns null when the payload cannot be
+	 * parsed, so the caller can fall back to building a fresh object.
+	 */
+	private function applyEventEdit(string $sExisting, string $sTitle, string $sStart,
+		string $sEnd, bool $bAllDay) : ?string
+	{
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sExisting, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VEVENT)) {
+				return null;
+			}
+
+			// Edit the master of a recurring series: the occurrence overrides
+			// carry RECURRENCE-ID and must keep their own times.
+			$oEvent = null;
+			foreach ($oVCal->VEVENT as $oCandidate) {
+				if (!isset($oCandidate->RECURRENCE_ID)) {
+					$oEvent = $oCandidate;
+					break;
+				}
+			}
+			$oEvent = $oEvent ?: $oVCal->VEVENT;
+
+			$sOldStart = (string) ($oEvent->DTSTART ?? '');
+			$sOldEnd   = (string) ($oEvent->DTEND ?? '');
+
+			$oEvent->SUMMARY = $sTitle;
+			$aDateParams = $bAllDay ? array('VALUE' => 'DATE') : array();
+			$oEvent->remove('DTSTART');
+			$oEvent->remove('DTEND');
+			$oEvent->add('DTSTART', $sStart, $aDateParams);
+			$oEvent->add('DTEND', $sEnd, $aDateParams);
+
+			// Attendees' clients ignore an update that does not advance
+			// SEQUENCE (RFC 5545 3.8.7.4).
+			if ($sOldStart !== (string) $oEvent->DTSTART || $sOldEnd !== (string) $oEvent->DTEND) {
+				$oEvent->SEQUENCE = ((int) ((string) ($oEvent->SEQUENCE ?? '0'))) + 1;
+			}
+			$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+
+			return $oVCal->serialize();
+		} catch (\Throwable $oException) {
+			return null;
+		}
+	}
+
 	private function makeCalDAVRequest($url, $method, $username, $password, $body = null, $headers = [])
 	{
 		$ch = curl_init($url);
@@ -465,19 +513,7 @@ class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sEndFormatted = $dtEnd->format('Ymd\THis\Z');
 			}
 			
-			// Create updated iCalendar
-			$sICS = "BEGIN:VCALENDAR\r\n";
-			$sICS .= "VERSION:2.0\r\n";
-			$sICS .= "PRODID:-//Mailbux//CalDAV Plugin//EN\r\n";
-			$sICS .= "BEGIN:VEVENT\r\n";
-			$sICS .= "UID:" . $sEventId . "\r\n";
-			$sICS .= "DTSTAMP:" . gmdate('Ymd\THis\Z') . "\r\n";
-			$sICS .= "DTSTART" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sStartFormatted . "\r\n";
-			$sICS .= "DTEND" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sEndFormatted . "\r\n";
-			$sICS .= "SUMMARY:" . $this->escapeICS($sTitle) . "\r\n";
-			$sICS .= "END:VEVENT\r\n";
-			$sICS .= "END:VCALENDAR\r\n";
-			
+
 			// Decrypt password using MAIN account's CryptKey
 			$oMainAccount = $this->Manager()->Actions()->GetMainAccountFromToken();
 			if (!$oMainAccount || !method_exists($oMainAccount, 'CryptKey')) {
@@ -493,6 +529,33 @@ class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
 			
 			// PUT updated event
 			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/default/' . $sEventId . '.ics';
+
+			// Edit the stored event instead of replacing it. Rebuilding the
+			// object from the few fields the dialog knows about drops
+			// everything else it carried - DESCRIPTION, LOCATION, VALARM,
+			// ORGANIZER, ATTENDEE and RRULE - so dragging a recurring event in
+			// the grid flattens it to a single occurrence and dragging an
+			// invited event silently uninvites everyone.
+			$sICS = null;
+			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
+			if (200 === $aFetch['code'] && strlen((string) $aFetch['body'])) {
+				$sICS = $this->applyEventEdit((string) $aFetch['body'], $sTitle,
+					$sStartFormatted, $sEndFormatted, $bAllDay);
+			}
+			if (null === $sICS) {
+				// Not on the server, or unreadable: fall back to a fresh object.
+				$sICS = "BEGIN:VCALENDAR\r\n"
+					. "VERSION:2.0\r\n"
+					. "PRODID:-//Mailbux//CalDAV Plugin//EN\r\n"
+					. "BEGIN:VEVENT\r\n"
+					. "UID:" . $sEventId . "\r\n"
+					. "DTSTAMP:" . gmdate('Ymd\THis\Z') . "\r\n"
+					. "DTSTART" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sStartFormatted . "\r\n"
+					. "DTEND" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sEndFormatted . "\r\n"
+					. "SUMMARY:" . $this->escapeICS($sTitle) . "\r\n"
+					. "END:VEVENT\r\n"
+					. "END:VCALENDAR\r\n";
+			}
 			
 			$result = $this->makeCalDAVRequest(
 				$sEventUrl,
