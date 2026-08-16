@@ -80,6 +80,28 @@ Editing a saved event re-sends the guest list, so adding or removing someone
 invites or uninvites them. `SEQUENCE` is advanced whenever the time or the guest
 list changes, which is what tells the attendees' clients to accept the update.
 
+### Cancelling versus deleting
+
+A meeting you organised shows a **Cancel meeting** button beside Delete:
+
+* **Cancel meeting** publishes the event with `STATUS:CANCELLED` and a raised
+  `SEQUENCE`, which is what the server turns into the
+  [RFC 5546](https://www.rfc-editor.org/rfc/rfc5546) `METHOD:CANCEL` it mails to
+  the guests, and only then removes it. The raised `SEQUENCE` is what lets a
+  guest's client match the cancellation to the invitation it already holds and
+  supersede it, rather than deciding for itself what a vanished event means.
+* **Delete** is unchanged: it removes the event resource and nothing more.
+
+Only the organiser sees Cancel, and only on an event that actually has guests. A
+guest who wants out is declining, not cancelling, and saying otherwise would
+misinform everyone else invited.
+
+One caveat worth knowing: on a server doing implicit scheduling, deleting an
+event you organise *already* makes the server send a `CANCEL` of its own. So
+Delete is not a way to call a meeting off quietly — the difference is that
+Cancel states what was cancelled, and Delete leaves the guest's client to infer
+it.
+
 ## Configuration
 
 Admin → Plugins → caldav:

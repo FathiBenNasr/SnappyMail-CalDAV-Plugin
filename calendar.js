@@ -163,6 +163,9 @@ cal.innerHTML = `
 .event-modal-btn-secondary:hover { background: var(--cal-bg-secondary); }
 .event-modal-btn-danger { background: var(--cal-danger); color: white; margin-right: auto; }
 .event-modal-btn-danger:hover { background: var(--cal-danger-hover); }
+.event-organizer-value { padding: 8px 0; opacity: .85; }
+.event-modal-btn-warning { background: #c77700; color: white; }
+.event-modal-btn-warning:hover { background: #a66300; }
 </style>
 <div class="cal-wrapper">
 <div class="cal-main">
@@ -213,6 +216,10 @@ cal.innerHTML = `
 					<label class="event-form-label">Location</label>
 					<input type="text" class="event-form-input" id="event-location" placeholder="Add location">
 				</div>
+				<div class="event-form-group" id="event-organizer-row" style="display:none;">
+					<label class="event-form-label">Organizer</label>
+					<div class="event-organizer-value" id="event-organizer"></div>
+				</div>
 				<div class="event-form-group">
 					<label class="event-form-label">Invite</label>
 					<input type="text" class="event-form-input" id="event-attendees" placeholder="email@example.com, another@example.com">
@@ -239,6 +246,7 @@ cal.innerHTML = `
 		</div>
 		<div class="event-modal-footer">
 			<button class="event-modal-btn event-modal-btn-danger" id="event-delete-btn" style="display:none;">Delete</button>
+			<button class="event-modal-btn event-modal-btn-warning" id="event-cancel-meeting-btn" style="display:none;" title="Tell the guests it is off, then remove it">Cancel meeting</button>
 			<button class="event-modal-btn event-modal-btn-secondary">Cancel</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="event-save-btn">Save Event</button>
 		</div>
@@ -275,6 +283,10 @@ cal.innerHTML = `
 		// Modal delete button
 		const deleteBtn = document.getElementById('event-delete-btn');
 		if (deleteBtn) deleteBtn.addEventListener('click', deleteEventFromModal);
+
+		// Cancelling a meeting is not deleting it: the guests have to be told.
+		const cancelMeetingBtn = document.getElementById('event-cancel-meeting-btn');
+		if (cancelMeetingBtn) cancelMeetingBtn.addEventListener('click', cancelMeetingFromModal);
 		
 		// All-day checkbox
 		const allDayCheck = document.getElementById('event-allday');
@@ -339,6 +351,13 @@ function openEventModal(eventData = null, fcEvent = null) {
 		// Edit mode
 		modalTitle.textContent = 'Edit Event';
 		deleteBtn.style.display = 'block';
+		// Only the organiser can call a meeting off, and only if anyone was
+		// invited to it in the first place.
+		const cancelMeetingBtn = document.getElementById('event-cancel-meeting-btn');
+		if (cancelMeetingBtn) {
+			const hasGuests = !!(eventData.attendees || '').trim();
+			cancelMeetingBtn.style.display = (hasGuests && false !== eventData.isOrganizer) ? 'block' : 'none';
+		}
 		const isAllDay = eventData.allDay || false;
 		document.getElementById('event-title').value = eventData.title || '';
 		document.getElementById('event-allday').checked = isAllDay;
@@ -347,6 +366,17 @@ function openEventModal(eventData = null, fcEvent = null) {
 		document.getElementById('event-reminder').value = eventData.reminder || '';
 		const att = document.getElementById('event-attendees');
 		if (att) att.value = eventData.attendees || '';
+
+		// Who called the meeting. Shown only for someone else's: on your own it
+		// would just be your own address staring back.
+		const orgRow = document.getElementById('event-organizer-row');
+		const orgVal = document.getElementById('event-organizer');
+		if (orgRow && orgVal) {
+			const organizer = (eventData.organizer || '').trim();
+			const showIt = organizer && false === eventData.isOrganizer;
+			orgVal.textContent = organizer;
+			orgRow.style.display = showIt ? 'block' : 'none';
+		}
 		
 		// Set date/time values based on allDay status
 		if (isAllDay) {
@@ -367,6 +397,10 @@ function openEventModal(eventData = null, fcEvent = null) {
 		// New event mode - default to timed event (not all-day) so time picker is visible
 		modalTitle.textContent = 'New Event';
 		deleteBtn.style.display = 'none';
+		const cancelMeetingBtnNew = document.getElementById('event-cancel-meeting-btn');
+		if (cancelMeetingBtnNew) cancelMeetingBtnNew.style.display = 'none';
+		const orgRowNew = document.getElementById('event-organizer-row');
+		if (orgRowNew) orgRowNew.style.display = 'none';
 		document.getElementById('event-form').reset();
 		const now = new Date();
 		const end = new Date(now.getTime() + 3600000); // 1 hour later
@@ -503,6 +537,35 @@ function saveEventFromModal() {
 	currentEditingEvent = null;
 }
 
+function cancelMeetingFromModal() {
+	if (!currentEditingEvent) return;
+
+	const guests = (currentEditingEvent.extendedProps?.attendees || '').trim();
+	if (!confirm(`Cancel "${currentEditingEvent.title}" and tell the guests it is off?\n\n${guests}`)) {
+		return;
+	}
+
+	const eventId = currentEditingEvent.id || currentEditingEvent.extendedProps?.uid;
+	if (!eventId || !rl.pluginRemoteRequest) return;
+
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			// Deliberately not removed from the view: if the server refused,
+			// the meeting is still on and the guests have not been told.
+			calError('cancel failed: ' + ((res && res.error) || 'error ' + iError));
+			alert((res && res.error) || 'The meeting could not be cancelled.');
+			return;
+		}
+		currentEditingEvent.remove();
+		document.getElementById('event-modal').classList.remove('show');
+		currentEditingEvent = null;
+		alert(res.notified
+			? 'Meeting cancelled. The guests have been notified.'
+			: 'Meeting cancelled.');
+	}, 'CancelCalendarEvent', { EventId: eventId });
+}
+
 function deleteEventFromModal() {
 	if (!currentEditingEvent) return;
 	
@@ -600,7 +663,9 @@ eventClick: function(info) {
 		location: event.extendedProps?.location || '',
 		description: event.extendedProps?.description || '',
 		reminder: event.extendedProps?.reminder || '',
-		attendees: event.extendedProps?.attendees || ''
+		attendees: event.extendedProps?.attendees || '',
+		organizer: event.extendedProps?.organizer || '',
+		isOrganizer: false !== event.extendedProps?.isOrganizer
 	}, event);
 },
 
@@ -661,7 +726,9 @@ return;
 			extendedProps: {
 				location: event.location || '',
 				description: event.description || '',
-				attendees: event.attendees || ''
+				attendees: event.attendees || '',
+				organizer: event.organizer || '',
+				isOrganizer: false !== event.isOrganizer
 			}
 		};
 	});

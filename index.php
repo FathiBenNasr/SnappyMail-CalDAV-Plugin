@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.1',
+		VERSION  = '2.2',
 		RELEASE  = '2026-08-16',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -17,6 +17,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('CreateCalendarEvent', 'DoCreateCalendarEvent');
 		$this->addJsonHook('UpdateCalendarEvent', 'DoUpdateCalendarEvent');
 		$this->addJsonHook('DeleteCalendarEvent', 'DoDeleteCalendarEvent');
+		$this->addJsonHook('CancelCalendarEvent', 'DoCancelCalendarEvent');
 		$this->addJsonHook('SuggestAttendees', 'DoSuggestAttendees');
 		
 		// Serve this plugin's static assets. There is no built-in route for
@@ -41,6 +42,45 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * The invited addresses of an event, as a display string. The organiser is
 	 * left out: they are not an invitee of their own meeting.
 	 */
+	/**
+	 * The organiser as something worth showing: "Name <address>" when the
+	 * invitation carried a CN, the bare address otherwise.
+	 *
+	 * The detail panel has always had a binding for this; nothing ever filled
+	 * it, so the row silently never appeared.
+	 */
+	private function organizerLabel($oEvent) : string
+	{
+		if (!isset($oEvent->ORGANIZER)) {
+			return '';
+		}
+		$sAddr = \trim(\preg_replace('#^mailto:#i', '', (string) $oEvent->ORGANIZER));
+		if (!\strlen($sAddr)) {
+			return '';
+		}
+		$sName = \trim((string) ($oEvent->ORGANIZER['CN'] ?? ''));
+		return (\strlen($sName) && 0 !== \strcasecmp($sName, $sAddr))
+			? $sName . ' <' . $sAddr . '>'
+			: $sAddr;
+	}
+
+	/**
+	 * Whether this account owns the meeting, which is what decides if it may
+	 * be cancelled. An event with no ORGANIZER was never scheduled with
+	 * anyone, so it belongs to whoever holds it.
+	 */
+	private function isOrganizer($oEvent, string $sSelf) : bool
+	{
+		if (!isset($oEvent->ORGANIZER)) {
+			return true;
+		}
+		if (!\strlen($sSelf)) {
+			return false;
+		}
+		$sAddr = \trim(\preg_replace('#^mailto:#i', '', (string) $oEvent->ORGANIZER));
+		return 0 === \strcasecmp($sAddr, $sSelf);
+	}
+
 	private function listAttendees($oEvent) : string
 	{
 		if (!isset($oEvent->ATTENDEE)) {
@@ -549,7 +589,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * Returns null when VObject cannot handle the payload, so the caller falls
 	 * back to the original line-based parser.
 	 */
-	private function parseICalendarVObject($icalData)
+	private function parseICalendarVObject($icalData, string $sSelf = '')
 	{
 		if (!\class_exists('\\Sabre\\VObject\\Reader')) {
 			return null;
@@ -611,6 +651,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					'location'    => (string) ($oEvent->LOCATION ?? ''),
 					'allDay'      => $bAllDay,
 					'attendees'   => $this->listAttendees($oEvent),
+					'organizer'   => $this->organizerLabel($oEvent),
+					'isOrganizer' => $this->isOrganizer($oEvent, $sSelf),
 					'alarms'      => $this->extractAlarms($oEvent, $oDtStart->getDateTime(), $oEndDt)
 				];
 			}
@@ -631,7 +673,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		// 109 stored events use them), resolves VTIMEZONE, and expands RRULE.
 		// Without expansion a yearly event created in 2022 is only ever
 		// returned for 2022, which is why most of the calendar looked empty.
-		$aEvents = $this->parseICalendarVObject($icalData);
+		$aEvents = $this->parseICalendarVObject($icalData, $oAccount->Email());
 		if (null !== $aEvents) {
 			return $aEvents;
 		}
@@ -656,7 +698,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					'dtend' => $this->parseICalDate($currentEvent['dtend'] ?? ''),
 					'description' => $currentEvent['description'] ?? '',
 					'location' => $currentEvent['location'] ?? '',
-					'allDay' => !isset($currentEvent['dtstart']) || strpos($currentEvent['dtstart'], 'T') === false
+					'allDay' => !isset($currentEvent['dtstart']) || strpos($currentEvent['dtstart'], 'T') === false,
+					'organizer' => \preg_replace('#^mailto:#i', '', $currentEvent['organizer'] ?? ''),
+					'isOrganizer' => \strlen($sSelf) && 0 === \strcasecmp(
+						\preg_replace('#^mailto:#i', '', $currentEvent['organizer'] ?? ''), $sSelf)
 				];
 				$events[] = $event;
 				$currentEvent = null;
@@ -758,7 +803,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$aEvents = [];
 			if ($result['code'] === 207) {
 				// Parse multistatus response
-				$aEvents = $this->parseCalDAVResponse($result['body']);
+				$aEvents = $this->parseCalDAVResponse($result['body'], $oAccount->Email());
 			} else {
 			}
 			
@@ -1025,6 +1070,104 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 	
 	/**
+	 * Cancel a meeting: tell the guests it is off, then remove it.
+	 *
+	 * Deleting the resource alone already makes an RFC 6638 server send a
+	 * CANCEL, but it says nothing about *what* was cancelled. RFC 5546 has the
+	 * organiser publish STATUS:CANCELLED with a raised SEQUENCE first, so the
+	 * guest's client can match the cancellation to the invitation it already
+	 * holds and supersede it, instead of deciding for itself what a vanished
+	 * event means.
+	 *
+	 * So: PUT the cancelled form - which is what the server turns into the
+	 * CANCEL it mails - and only then DELETE, so the organiser is not left
+	 * with a cancelled ghost in their own calendar.
+	 *
+	 * Only the organiser may do this. A guest wanting out is declining, not
+	 * cancelling, and saying otherwise would misinform everyone else invited.
+	 */
+	public function DoCancelCalendarEvent() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			if (!$oAccount) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Not logged in']);
+			}
+
+			$aConfig = $this->getCalendarConfig($oAccount);
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+
+			$sEventId = $this->jsonParam('EventId', '');
+			if (!$sEventId) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Event ID required']);
+			}
+
+			$oMainAccount = $this->Manager()->Actions()->GetMainAccountFromToken();
+			if (!$oMainAccount || !\method_exists($oMainAccount, 'CryptKey')) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+			$sCryptKey = $oMainAccount->CryptKey();
+			$sPassword = \SnappyMail\Crypt::DecryptFromJSON($aConfig['Password'], $sCryptKey);
+			if (\is_object($sPassword) && \method_exists($sPassword, '__toString')) {
+				$sPassword = (string) $sPassword;
+			}
+
+			$sEventUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
+				. '/' . \rawurlencode($sEventId) . '.ics';
+
+			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
+			if (200 !== (int) $aFetch['code'] || !\strlen((string) $aFetch['body'])) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Event not found on the server']);
+			}
+
+			$oVCal = \Sabre\VObject\Reader::read($aFetch['body'], \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!isset($oVCal->VEVENT)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Not an event']);
+			}
+
+			$sSelf = $oAccount->Email();
+			$bGuests = false;
+			foreach ($oVCal->VEVENT as $oEvent) {
+				if (!$this->isOrganizer($oEvent, $sSelf)) {
+					return $this->jsonResponse(__FUNCTION__, ['success' => false,
+						'error' => 'Only the organiser can cancel this meeting. Delete it to remove it from your own calendar.']);
+				}
+				if (isset($oEvent->ATTENDEE)) {
+					$bGuests = true;
+				}
+
+				$oEvent->STATUS = 'CANCELLED';
+				// A cancellation that does not outrank the invitation the guest
+				// already holds may legitimately be ignored by their client.
+				$iSequence = isset($oEvent->SEQUENCE) ? (int) $oEvent->SEQUENCE->getValue() : 0;
+				$oEvent->SEQUENCE = $iSequence + 1;
+				$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+			}
+
+			// Publishing the cancelled form is what the server turns into the
+			// CANCEL mail. A server without scheduling merely stores it, and
+			// the DELETE below still cleans up, so this is safe either way.
+			$aPut = $this->makeCalDAVRequest($sEventUrl, 'PUT', $aConfig['User'], $sPassword,
+				$oVCal->serialize(), ['Content-Type: text/calendar; charset=utf-8']);
+			$bNotified = \in_array((int) $aPut['code'], [200, 201, 204], true);
+
+			$aDel = $this->makeCalDAVRequest($sEventUrl, 'DELETE', $aConfig['User'], $sPassword);
+			if (!\in_array((int) $aDel['code'], [200, 204, 404], true)) {
+				// The guests have already been told, so say so: a blind retry
+				// would notify them a second time.
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'notified' => $bNotified,
+					'error' => 'The guests were notified, but the event could not be removed (CalDAV error: ' . $aDel['code'] . ')']);
+			}
+
+			return $this->jsonResponse(__FUNCTION__, ['success' => true, 'notified' => $bNotified && $bGuests]);
+		} catch (\Throwable $e) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $e->getMessage()]);
+		}
+	}
+
+	/**
 	 * Delete calendar event
 	 */
 	public function DoDeleteCalendarEvent() : array
@@ -1093,7 +1236,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	/**
 	 * Parse CalDAV XML response
 	 */
-	private function parseCalDAVResponse($xml)
+	private function parseCalDAVResponse($xml, string $sSelf = '')
 	{
 		$events = [];
 		
