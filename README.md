@@ -70,6 +70,10 @@ marks them with `SCHEDULE-STATUS`. Verified against Cyrus IMAP, which returns
 be enabled on the server - on Cyrus that is `caldav_allowscheduling`, with
 `imipnotifier` for delivery by mail.
 
+The field completes as you type, from the same sources SnappyMail uses when you
+address a message. How far it reaches is a deployment decision - see
+**Complete attendees from the whole directory** below.
+
 Replies update the attendee list as the participants answer.
 
 Editing a saved event re-sends the guest list, so adding or removing someone
@@ -84,9 +88,33 @@ Admin → Plugins → caldav:
 | --- | --- |
 | CalDAV URL template | `https://dav.example.com/dav/calendars/user/{user}/Default/` |
 | DAV default domain | `example.com` — addresses in this domain use the local part only, matching Cyrus `virtdomains: userid`; leave empty to always use the full address |
+| Complete attendees from the whole directory | Off by default |
 
 Leave the template empty to derive the calendar URL from the CardDAV plugin
 settings instead.
+
+### Attendee completion and who can be found
+
+**Complete attendees from the whole directory** decides what the Invite field
+will offer:
+
+* **Off (default)** — the organiser's own address book only. They are offered
+  nobody they did not already have a contact for.
+* **On** — every source SnappyMail has, including an LDAP corporate directory if
+  a suggestions plugin provides one. An organiser can invite any colleague by
+  typing part of their name.
+
+Which is right depends on who shares the server:
+
+* A **single organisation** normally wants this **on**. The directory exists so
+  staff can find each other.
+* A **hosting provider or ISP** must leave it **off**. The suggestions chain is
+  global, so with a directory source installed, any customer could type two
+  letters and enumerate the addresses of unrelated customers on the same server.
+
+It changes only what is *offered*. An organiser can always type an address by
+hand, and whether the invitation is delivered remains the CalDAV server's
+decision.
 
 ## Authors
 

@@ -4,8 +4,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.0',
-		RELEASE  = '2025-11-12',
+		VERSION  = '2.1',
+		RELEASE  = '2026-08-16',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
 		REQUIRED = '2.0.0';
@@ -17,6 +17,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('CreateCalendarEvent', 'DoCreateCalendarEvent');
 		$this->addJsonHook('UpdateCalendarEvent', 'DoUpdateCalendarEvent');
 		$this->addJsonHook('DeleteCalendarEvent', 'DoDeleteCalendarEvent');
+		$this->addJsonHook('SuggestAttendees', 'DoSuggestAttendees');
 		
 		// Serve this plugin's static assets. There is no built-in route for
 		// them: ServiceActions::ServicePlugins() ignores everything after
@@ -168,6 +169,83 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 
 	/**
+	 * Complete attendee addresses while the user types.
+	 *
+	 * Sources are the ones SnappyMail already has, so a contact that completes
+	 * when writing a message completes here too and no separate lookup against
+	 * the CalDAV server is needed. How far it reaches depends on
+	 * attendee_directory_lookup:
+	 *
+	 *   off (default) - the user's own address book only, which on a
+	 *                   deployment running the companion CardDAV plugin is
+	 *                   their CardDAV contacts.
+	 *   on            - the full suggestions chain, address book plus any
+	 *                   suggestion plugin such as LDAP.
+	 *
+	 * The distinction matters because the chain is global: with an LDAP
+	 * suggestions plugin installed, leaving this open would let any user of a
+	 * shared server enumerate every address it hosts.
+	 */
+	public function DoSuggestAttendees() : array
+	{
+		try {
+			$oActions = $this->Manager()->Actions();
+			$oAccount = $oActions->getAccountFromToken();
+			if (!$oAccount) {
+				return $this->jsonResponse(__FUNCTION__, array('suggestions' => array()));
+			}
+
+			// A single character matches most of an address book, so wait for
+			// the user to commit to two before touching the provider chain.
+			$sQuery = \trim((string) $this->jsonParam('Query', ''));
+			if (2 > \mb_strlen($sQuery)) {
+				return $this->jsonResponse(__FUNCTION__, array('suggestions' => array()));
+			}
+
+			// Whether an organiser may reach past their own contacts is a
+			// deployment decision, not a plugin one: on a corporate server the
+			// directory is the point, while on a hosting server it would let
+			// one customer enumerate another's addresses. Default is closed.
+			$bDirectory = (bool) $this->Config()->Get('plugin', 'attendee_directory_lookup', false);
+
+			// contacts.suggestions_limit is tuned for the compose screen and is
+			// commonly as low as 5. The event dialog has room for more, so take
+			// that as a floor rather than editing a setting shared with compose.
+			$iLimit = \max(10, (int) $oActions->Config()->Get('contacts', 'suggestions_limit', 20));
+
+			if ($bDirectory) {
+				// Every source SnappyMail knows: the address book first, then
+				// suggestion plugins such as LDAP.
+				$oProvider = $oActions->SuggestionsProvider();
+				$aItems = $oProvider ? $oProvider->Process($oAccount, $sQuery, $iLimit) : array();
+			} else {
+				// The user's own address book alone. Deliberately not the
+				// suggestions chain, which would pull in the global sources
+				// this setting exists to keep out.
+				$oBook = $oActions->AddressBookProvider($oAccount);
+				$aItems = ($oBook && $oBook->IsActive()) ? $oBook->GetSuggestions($sQuery, $iLimit) : array();
+			}
+
+			$aSuggestions = array();
+			foreach ($aItems as $aItem) {
+				$sEmail = \trim((string) ($aItem[0] ?? ''));
+				if (\strlen($sEmail)) {
+					$aSuggestions[] = array(
+						'email' => $sEmail,
+						'name'  => \trim((string) ($aItem[1] ?? ''))
+					);
+				}
+			}
+
+			return $this->jsonResponse(__FUNCTION__, array('suggestions' => $aSuggestions));
+		} catch (\Throwable $e) {
+			// Completion is a convenience: a failure here must never stop the
+			// user typing an address by hand.
+			return $this->jsonResponse(__FUNCTION__, array('suggestions' => array()));
+		}
+	}
+
+	/**
 	 * Serve a whitelisted static file from this plugin directory.
 	 * URL: /?CalDavAsset/<name>
 	 */
@@ -232,6 +310,20 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				->SetDescription('Default protocol to use for calendar sync')
 				->SetDefaultValue(['caldav', 'jmap'])
 				->SetDefaultValue('caldav'),
+			\RainLoop\Plugins\Property::NewInstance('attendee_directory_lookup')
+				->SetLabel('Complete attendees from the whole directory')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)
+				->SetDescription('Off: the attendee field completes only from the'
+					. ' user\'s own address book, so an organiser sees nobody they'
+					. ' did not already have a contact for. On: it also completes'
+					. ' from every source SnappyMail has, such as an LDAP corporate'
+					. ' directory, letting an organiser invite any colleague by'
+					. ' typing part of their name.'
+					. ' Leave this OFF on shared or multi-tenant servers: it would'
+					. ' let any user enumerate the addresses of everyone else'
+					. ' hosted there. Turn it on for a single organisation whose'
+					. ' directory its own staff are meant to see.')
+				->SetDefaultValue(false),
 			\RainLoop\Plugins\Property::NewInstance('auto_sync')
 				->SetLabel('Auto Sync')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)

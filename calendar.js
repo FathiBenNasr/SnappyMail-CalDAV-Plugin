@@ -852,6 +852,115 @@ function deleteEvent(eventId) {
 
 // Calendar link removed - now handled by contacts popover
 
+// ---------------------------------------------------------------------------
+// Attendee autocomplete
+//
+// The field holds a comma-separated list, so only the token after the last
+// separator is being typed - the ones before it are settled addresses and are
+// left untouched. Suggestions come from the server hook, which asks the same
+// provider the compose screen uses.
+// ---------------------------------------------------------------------------
+(() => {
+	const MIN_CHARS = 2, DEBOUNCE_MS = 180;
+	let box = null, items = [], active = -1, timer = null, seq = 0;
+
+	const close = () => {
+		box && box.remove();
+		box = null; items = []; active = -1;
+	};
+
+	// Everything before the last separator is already chosen; the remainder is
+	// the fragment to complete.
+	const split = value => {
+		const parts = value.split(/[,;]/);
+		return { head: parts.slice(0, -1), tail: parts[parts.length - 1] || '' };
+	};
+
+	const choose = (input, item) => {
+		const chosen = item.name ? item.name + ' <' + item.email + '>' : item.email;
+		const kept = split(input.value).head.map(s => s.trim()).filter(Boolean);
+		input.value = kept.concat(chosen).join(', ') + ', ';
+		close();
+		input.focus();
+	};
+
+	const highlight = () => {
+		if (!box) return;
+		[...box.children].forEach((el, i) => el.classList.toggle('is-active', i === active));
+	};
+
+	const render = (input, list) => {
+		close();
+		if (!list.length) return;
+		items = list;
+		box = document.createElement('div');
+		box.className = 'caldav-suggest';
+		const r = input.getBoundingClientRect();
+		box.style.left = r.left + 'px';
+		box.style.top = (r.bottom + 2) + 'px';
+		box.style.width = r.width + 'px';
+		list.forEach((item, i) => {
+			const row = document.createElement('div');
+			row.className = 'caldav-suggest-item';
+			row.textContent = item.name ? item.name + ' \u2014 ' + item.email : item.email;
+			row.title = item.email;
+			// mousedown, not click: blur would tear the list down first.
+			row.addEventListener('mousedown', e => { e.preventDefault(); choose(input, list[i]); });
+			box.append(row);
+		});
+		document.body.append(box);
+	};
+
+	const query = input => {
+		const tail = split(input.value).tail.trim();
+		if (tail.length < MIN_CHARS || !rl.pluginRemoteRequest) {
+			close();
+			return;
+		}
+		const mine = ++seq;
+		rl.pluginRemoteRequest((iError, oData) => {
+			// A slower earlier request must not overwrite a newer one's results.
+			if (mine !== seq || iError || !oData || !oData.Result) return;
+			render(input, oData.Result.suggestions || []);
+		}, 'SuggestAttendees', { Query: tail });
+	};
+
+	document.addEventListener('input', e => {
+		if (e.target && 'event-attendees' === e.target.id) {
+			clearTimeout(timer);
+			timer = setTimeout(() => query(e.target), DEBOUNCE_MS);
+		}
+	});
+
+	document.addEventListener('keydown', e => {
+		if (!box || !e.target || 'event-attendees' !== e.target.id) return;
+		if ('ArrowDown' === e.key || 'ArrowUp' === e.key) {
+			e.preventDefault();
+			active = ('ArrowDown' === e.key)
+				? (active + 1) % items.length
+				: (active <= 0 ? items.length - 1 : active - 1);
+			highlight();
+		} else if ('Enter' === e.key && active > -1) {
+			// Only swallow Enter when a suggestion is selected, so the key still
+			// reaches the form otherwise.
+			e.preventDefault();
+			choose(e.target, items[active]);
+		} else if ('Escape' === e.key) {
+			close();
+		}
+	});
+
+	document.addEventListener('click', e => {
+		if (!box) return;
+		if (!box.contains(e.target) && e.target.id !== 'event-attendees') close();
+	}, true);
+
+	// The list is positioned against the viewport, so it would otherwise hang
+	// in place once the page moves under it.
+	window.addEventListener('scroll', close, true);
+	window.addEventListener('resize', close);
+})();
+
 window.MailbuxCalendar = {
 	refresh: () => { if (calendar) calendar.refetchEvents(); },
 	show: showCalendar,

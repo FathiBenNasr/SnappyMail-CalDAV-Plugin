@@ -768,3 +768,31 @@
 .fc .fc-daygrid-day.fc-day-today {
 	background-color: #e0e0e0 !important;
 }
+
+/* Attendee autocomplete.
+   Positioned against the viewport rather than inside the dialog: the event
+   form clips its own overflow, which would cut the list off after a row or
+   two. The z-index has to clear the modal it sits over. */
+.caldav-suggest {
+	position: fixed;
+	z-index: 10000;
+	max-height: 15em;
+	overflow-y: auto;
+	background: #fff;
+	border: 1px solid #c8c8c8;
+	border-radius: 3px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+.caldav-suggest-item {
+	padding: 0.35em 0.6em;
+	cursor: pointer;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.caldav-suggest-item:hover,
+.caldav-suggest-item.is-active {
+	background-color: #e0e0e0;
+}
