@@ -517,6 +517,65 @@ class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
 	/**
 	 * Delete calendar event
 	 */
+	/**
+	 * Publish STATUS:CANCELLED before an organiser deletes a meeting.
+	 *
+	 * Deleting the resource is already enough for an RFC 6638 server to mail a
+	 * CANCEL to the guests, but it carries no statement of what happened, so a
+	 * guest's client is left to infer it. RFC 5546 has the organiser publish
+	 * STATUS:CANCELLED with a raised SEQUENCE, which is what lets that client
+	 * match the cancellation to the invitation it already holds and supersede
+	 * it, rather than showing a meeting that quietly stopped existing.
+	 *
+	 * Nothing here changes deletion of an ordinary event: without ATTENDEE
+	 * there is nobody to tell, and an event organised by someone else is not
+	 * ours to cancel - deleting that is just leaving, and the server turns it
+	 * into a REPLY on its own.
+	 *
+	 * Failures are deliberately silent. This is an improvement to the message
+	 * the guests receive, and must never be the reason a delete fails.
+	 */
+	private function announceCancellation(string $sEventUrl, string $sUser, string $sPassword, string $sSelf) : void
+	{
+		try {
+			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $sUser, $sPassword);
+			if (200 !== (int) $aFetch['code'] || !strlen((string) $aFetch['body'])) {
+				return;
+			}
+
+			$oVCal = \Sabre\VObject\Reader::read($aFetch['body'], \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!isset($oVCal->VEVENT)) {
+				return;
+			}
+
+			$bAnnounce = false;
+			foreach ($oVCal->VEVENT as $oEvent) {
+				if (!isset($oEvent->ATTENDEE) || !isset($oEvent->ORGANIZER)) {
+					return;
+				}
+				$sOrganizer = preg_replace('#^mailto:#i', '', trim((string) $oEvent->ORGANIZER));
+				if (0 !== strcasecmp($sOrganizer, $sSelf)) {
+					return;
+				}
+
+				$oEvent->STATUS = 'CANCELLED';
+				// A cancellation that does not outrank the invitation the guest
+				// already holds may legitimately be ignored by their client.
+				$iSequence = isset($oEvent->SEQUENCE) ? (int) $oEvent->SEQUENCE->getValue() : 0;
+				$oEvent->SEQUENCE = $iSequence + 1;
+				$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+				$bAnnounce = true;
+			}
+
+			if ($bAnnounce) {
+				$this->makeCalDAVRequest($sEventUrl, 'PUT', $sUser, $sPassword,
+					$oVCal->serialize(), ['Content-Type: text/calendar; charset=utf-8']);
+			}
+		} catch (\Throwable $oException) {
+			// See above: never block the delete.
+		}
+	}
+
 	public function DoDeleteCalendarEvent() : array
 	{
 		try {
@@ -552,6 +611,10 @@ class MailbuxCalDAVAutoPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// URL-encode the event ID to handle @ symbols properly
 			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/default/' . rawurlencode($sEventId) . '.ics';
 			
+			// If this is a meeting we organised, say it is cancelled before
+			// removing it, so the guests are told what happened rather than
+			// left to work it out from an event that vanished.
+			$this->announceCancellation($sEventUrl, $aConfig['User'], $sPassword, $oAccount->Email());
 			
 			$result = $this->makeCalDAVRequest(
 				$sEventUrl,
