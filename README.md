@@ -92,6 +92,11 @@ A meeting you organised shows a **Cancel meeting** button beside Delete:
   supersede it, rather than deciding for itself what a vanished event means.
 * **Delete** is unchanged: it removes the event resource and nothing more.
 
+Cancelling asks for an optional **reason**, which travels to the guests in
+`COMMENT` - the property RFC 5546 reserves for it - and is also prepended to
+`DESCRIPTION`, because a good many clients render only the latter and a reason
+nobody sees is no reason at all.
+
 Only the organiser sees Cancel, and only on an event that actually has guests. A
 guest who wants out is declining, not cancelling, and saying otherwise would
 misinform everyone else invited.

@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.2',
+		VERSION  = '2.3',
 		RELEASE  = '2026-08-16',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -1127,6 +1127,13 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Not an event']);
 			}
 
+			// Why it is off. Guests get told the meeting is cancelled either
+			// way; without this they are not told why.
+			$sReason = \trim((string) $this->jsonParam('Reason', ''));
+			if (1000 < \strlen($sReason)) {
+				$sReason = \substr($sReason, 0, 1000);
+			}
+
 			$sSelf = $oAccount->Email();
 			$bGuests = false;
 			foreach ($oVCal->VEVENT as $oEvent) {
@@ -1139,6 +1146,20 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				}
 
 				$oEvent->STATUS = 'CANCELLED';
+
+				if (\strlen($sReason)) {
+					// COMMENT is what RFC 5546 reserves for exactly this, and
+					// is what a conforming client reads off a CANCEL. Plenty of
+					// clients only ever render DESCRIPTION though, so the
+					// reason goes there too rather than being technically
+					// correct and invisible.
+					$oEvent->remove('COMMENT');
+					$oEvent->add('COMMENT', $sReason);
+					$sOldDescription = \trim((string) ($oEvent->DESCRIPTION ?? ''));
+					$oEvent->DESCRIPTION = \strlen($sOldDescription)
+						? 'Cancelled: ' . $sReason . "\n\n" . $sOldDescription
+						: 'Cancelled: ' . $sReason;
+				}
 				// A cancellation that does not outrank the invitation the guest
 				// already holds may legitimately be ignored by their client.
 				$iSequence = isset($oEvent->SEQUENCE) ? (int) $oEvent->SEQUENCE->getValue() : 0;

@@ -252,6 +252,26 @@ cal.innerHTML = `
 		</div>
 	</div>
 </div>
+
+<div class="event-modal-overlay" id="cancel-reason-modal">
+	<div class="event-modal">
+		<div class="event-modal-header">
+			<h3 class="event-modal-title">Cancel meeting</h3>
+		</div>
+		<div class="event-modal-body">
+			<p id="cancel-reason-intro"></p>
+			<div class="event-form-group">
+				<label class="event-form-label" for="cancel-reason-text">Reason (optional)</label>
+				<textarea class="event-form-textarea" id="cancel-reason-text" rows="3"
+					placeholder="Why is it off? The guests will see this."></textarea>
+			</div>
+		</div>
+		<div class="event-modal-footer">
+			<button class="event-modal-btn event-modal-btn-secondary" id="cancel-reason-back">Back</button>
+			<button class="event-modal-btn event-modal-btn-warning" id="cancel-reason-confirm">Cancel meeting</button>
+		</div>
+	</div>
+</div>
 `;
 		document.body.appendChild(cal);
 
@@ -287,6 +307,13 @@ cal.innerHTML = `
 		// Cancelling a meeting is not deleting it: the guests have to be told.
 		const cancelMeetingBtn = document.getElementById('event-cancel-meeting-btn');
 		if (cancelMeetingBtn) cancelMeetingBtn.addEventListener('click', cancelMeetingFromModal);
+
+		const reasonBack = document.getElementById('cancel-reason-back');
+		if (reasonBack) reasonBack.addEventListener('click', () => {
+			document.getElementById('cancel-reason-modal').classList.remove('show');
+		});
+		const reasonConfirm = document.getElementById('cancel-reason-confirm');
+		if (reasonConfirm) reasonConfirm.addEventListener('click', sendCancellation);
 		
 		// All-day checkbox
 		const allDayCheck = document.getElementById('event-allday');
@@ -540,30 +567,52 @@ function saveEventFromModal() {
 function cancelMeetingFromModal() {
 	if (!currentEditingEvent) return;
 
+	// A textarea will not fit in confirm(), and the reason is the point of
+	// this step, so it gets a dialog of its own.
 	const guests = (currentEditingEvent.extendedProps?.attendees || '').trim();
-	if (!confirm(`Cancel "${currentEditingEvent.title}" and tell the guests it is off?\n\n${guests}`)) {
-		return;
+	const intro = document.getElementById('cancel-reason-intro');
+	const text = document.getElementById('cancel-reason-text');
+	const modal = document.getElementById('cancel-reason-modal');
+	if (!modal || !text) return;
+
+	if (intro) {
+		intro.textContent = `"${currentEditingEvent.title}" will be called off and these guests told: ${guests}`;
 	}
+	text.value = '';
+	modal.classList.add('show');
+	text.focus();
+}
+
+function sendCancellation() {
+	if (!currentEditingEvent) return;
 
 	const eventId = currentEditingEvent.id || currentEditingEvent.extendedProps?.uid;
 	if (!eventId || !rl.pluginRemoteRequest) return;
 
+	const text = document.getElementById('cancel-reason-text');
+	const reason = text ? text.value.trim() : '';
+	const btn = document.getElementById('cancel-reason-confirm');
+	// The guests are mailed once. A double click must not tell them twice.
+	if (btn) { btn.disabled = true; btn.textContent = 'Cancelling...'; }
+
 	rl.pluginRemoteRequest((iError, oData) => {
+		if (btn) { btn.disabled = false; btn.textContent = 'Cancel meeting'; }
 		const res = oData && oData.Result;
 		if (iError || !res || !res.success) {
-			// Deliberately not removed from the view: if the server refused,
-			// the meeting is still on and the guests have not been told.
+			// Deliberately left in the view: if the server refused, the meeting
+			// is still on and the guests have not been told.
 			calError('cancel failed: ' + ((res && res.error) || 'error ' + iError));
 			alert((res && res.error) || 'The meeting could not be cancelled.');
 			return;
 		}
+		document.getElementById('cancel-reason-modal').classList.remove('show');
 		currentEditingEvent.remove();
 		document.getElementById('event-modal').classList.remove('show');
 		currentEditingEvent = null;
 		alert(res.notified
 			? 'Meeting cancelled. The guests have been notified.'
 			: 'Meeting cancelled.');
-	}, 'CancelCalendarEvent', { EventId: eventId });
+	}, 'CancelCalendarEvent', { EventId: eventId, Reason: reason });
 }
 
 function deleteEventFromModal() {
