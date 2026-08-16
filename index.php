@@ -176,15 +176,18 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * the CalDAV server is needed. How far it reaches depends on
 	 * attendee_directory_lookup:
 	 *
-	 *   off (default) - the user's own address book only, which on a
-	 *                   deployment running the companion CardDAV plugin is
-	 *                   their CardDAV contacts.
-	 *   on            - the full suggestions chain, address book plus any
-	 *                   suggestion plugin such as LDAP.
+	 *   on (default) - the full suggestions chain, address book plus any
+	 *                  suggestion plugin such as LDAP. This is the corporate
+	 *                  case, and assumes the configured directory belongs to
+	 *                  one organisation - a provider is expected to give each
+	 *                  tenant its own root rather than sharing one.
+	 *   off          - the user's own address book only, which on a deployment
+	 *                  running the companion CardDAV plugin is their CardDAV
+	 *                  contacts. For the case where one directory really is
+	 *                  shared by unrelated tenants.
 	 *
-	 * The distinction matters because the chain is global: with an LDAP
-	 * suggestions plugin installed, leaving this open would let any user of a
-	 * shared server enumerate every address it hosts.
+	 * The chain is global, so off does not filter its results - it does not
+	 * consult it at all.
 	 */
 	public function DoSuggestAttendees() : array
 	{
@@ -202,11 +205,12 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				return $this->jsonResponse(__FUNCTION__, array('suggestions' => array()));
 			}
 
-			// Whether an organiser may reach past their own contacts is a
-			// deployment decision, not a plugin one: on a corporate server the
-			// directory is the point, while on a hosting server it would let
-			// one customer enumerate another's addresses. Default is closed.
-			$bDirectory = (bool) $this->Config()->Get('plugin', 'attendee_directory_lookup', false);
+			// Default is the corporate case: the directory exists so colleagues
+			// can find each other, and a provider is expected to give each
+			// tenant its own root. Where one directory really is shared between
+			// unrelated tenants, this is what turns completion back to the
+			// user's own contacts.
+			$bDirectory = (bool) $this->Config()->Get('plugin', 'attendee_directory_lookup', true);
 
 			// contacts.suggestions_limit is tuned for the compose screen and is
 			// commonly as low as 5. The event dialog has room for more, so take
@@ -313,17 +317,18 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			\RainLoop\Plugins\Property::NewInstance('attendee_directory_lookup')
 				->SetLabel('Complete attendees from the whole directory')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)
-				->SetDescription('Off: the attendee field completes only from the'
-					. ' user\'s own address book, so an organiser sees nobody they'
-					. ' did not already have a contact for. On: it also completes'
-					. ' from every source SnappyMail has, such as an LDAP corporate'
-					. ' directory, letting an organiser invite any colleague by'
-					. ' typing part of their name.'
-					. ' Leave this OFF on shared or multi-tenant servers: it would'
-					. ' let any user enumerate the addresses of everyone else'
-					. ' hosted there. Turn it on for a single organisation whose'
-					. ' directory its own staff are meant to see.')
-				->SetDefaultValue(false),
+				->SetDescription('On (default): the attendee field completes from'
+					. ' every source SnappyMail has, including an LDAP corporate'
+					. ' directory, so an organiser can invite any colleague by'
+					. ' typing part of their name. This assumes the configured'
+					. ' directory belongs to one organisation, which is how a'
+					. ' hosting provider should set it up - each tenant its own'
+					. ' root.'
+					. ' Turn it OFF where that does not hold and one directory is'
+					. ' shared by unrelated tenants, since completion would then'
+					. ' let any user enumerate the others addresses. Off restricts'
+					. ' completion to the user\'s own address book.')
+				->SetDefaultValue(true),
 			\RainLoop\Plugins\Property::NewInstance('auto_sync')
 				->SetLabel('Auto Sync')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)

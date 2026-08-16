@@ -98,19 +98,25 @@ settings instead.
 **Complete attendees from the whole directory** decides what the Invite field
 will offer:
 
-* **Off (default)** — the organiser's own address book only. They are offered
-  nobody they did not already have a contact for.
-* **On** — every source SnappyMail has, including an LDAP corporate directory if
-  a suggestions plugin provides one. An organiser can invite any colleague by
-  typing part of their name.
+* **On (default)** — every source SnappyMail has, including an LDAP corporate
+  directory if a suggestions plugin provides one. An organiser can invite any
+  colleague by typing part of their name.
+* **Off** — the organiser's own address book only. They are offered nobody they
+  did not already have a contact for.
 
-Which is right depends on who shares the server:
+The default assumes what a correctly built deployment provides: **the configured
+directory belongs to one organisation**. A hosting provider should give each
+tenant its own directory root rather than pointing every tenant at a shared one,
+in which case completion only ever reaches that tenant's own people.
 
-* A **single organisation** normally wants this **on**. The directory exists so
-  staff can find each other.
-* A **hosting provider or ISP** must leave it **off**. The suggestions chain is
-  global, so with a directory source installed, any customer could type two
-  letters and enumerate the addresses of unrelated customers on the same server.
+Turn it **off** where that does not hold — where one directory genuinely is
+shared by unrelated tenants — because the suggestions chain is global, and
+completion would then let any user enumerate the others' addresses.
+
+Note that SnappyMail's LDAP suggestions plugin is configured per instance, not
+per domain: one `base_dn` serves every account on that instance. Giving tenants
+separate roots therefore means separate SnappyMail instances, or a suggestions
+plugin that scopes the search by the account's domain.
 
 It changes only what is *offered*. An organiser can always type an address by
 hand, and whether the invitation is delivered remains the CalDAV server's
