@@ -29,12 +29,19 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		// file instead of the library and window.FullCalendar stayed undefined.
 		$this->addPartHook('CalDavAsset', 'ServiceCalDavAsset');
 
-		// Add JavaScript
-		$this->addJs('calendar.js');
-		// Replaces contacts-popover.js, which reached the calendar by hijacking
-		// the Contacts button. contacts-popover.js is kept in the tree for
-		// reference but is no longer loaded.
+		// Add JavaScript.
+		//
+		// Order matters more than it looks: SnappyMail concatenates every
+		// enabled plugin's JS into one script, so a throw at the top level of
+		// one file stops every file after it from running at all. The toolbar
+		// entry is the way into the calendar, so it registers first and cannot
+		// be taken down by anything calendar.js does.
+		//
+		// sidebar.js replaces contacts-popover.js, which reached the calendar
+		// by hijacking the Contacts button. contacts-popover.js is kept in the
+		// tree for reference but is no longer loaded.
 		$this->addJs('sidebar.js');
+		$this->addJs('calendar.js');
 
 		// Add CSS
 		$this->addCss('calendar.css');
