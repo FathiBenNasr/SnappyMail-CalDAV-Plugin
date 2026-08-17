@@ -666,14 +666,14 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	/**
 	 * Parse iCalendar data
 	 */
-	private function parseICalendar($icalData)
+	private function parseICalendar($icalData, string $sSelf = '')
 	{
 		// SnappyMail bundles Sabre VObject 4.5.2; use it in preference to the
 		// hand-rolled reader below. It unfolds continuation lines (65 of the
 		// 109 stored events use them), resolves VTIMEZONE, and expands RRULE.
 		// Without expansion a yearly event created in 2022 is only ever
 		// returned for 2022, which is why most of the calendar looked empty.
-		$aEvents = $this->parseICalendarVObject($icalData, $oAccount->Email());
+		$aEvents = $this->parseICalendarVObject($icalData, $sSelf);
 		if (null !== $aEvents) {
 			return $aEvents;
 		}
@@ -1275,7 +1275,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$calendarData = $xpath->query('.//C:calendar-data', $response);
 				if ($calendarData->length > 0) {
 					$icalData = $calendarData->item(0)->nodeValue;
-					$parsedEvents = $this->parseICalendar($icalData);
+					$parsedEvents = $this->parseICalendar($icalData, $sSelf);
 					$events = array_merge($events, $parsedEvents);
 				}
 			}
