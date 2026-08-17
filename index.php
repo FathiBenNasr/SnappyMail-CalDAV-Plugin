@@ -738,8 +738,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			\RainLoop\Plugins\Property::NewInstance('geocoder_fallback_url')
 				->SetLabel('Geocoder fallback URL')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
-				->SetDescription('Consulted only when the geocoder above finds nothing, e.g.'
-					. ' https://nominatim.openstreetmap.org. A self-hosted geocoder is usually'
+				->SetPlaceholder('https://nominatim.openstreetmap.org')
+				->SetDescription('Consulted only when the geocoder above finds nothing.'
+					. ' A self-hosted geocoder is usually'
 					. ' a single-country extract, so a meeting abroad finds nothing at all;'
 					. ' this keeps the common case local while still answering the rare one.'
 					. ' Leave empty for no fallback. Off unless filled in: a fallback sends'
