@@ -116,9 +116,42 @@ Admin → Plugins → caldav:
 | CalDAV URL template | `https://dav.example.com/dav/calendars/user/{user}/Default/` |
 | DAV default domain | `example.com` — addresses in this domain use the local part only, matching Cyrus `virtdomains: userid`; leave empty to always use the full address |
 | Complete attendees from the whole directory | Off by default |
+| Video meeting server URL | `https://meet.example.com` — empty hides the camera button |
+| Geocoder URL (location picker) | `https://nominatim.openstreetmap.org` — empty hides the globe button |
 
 Leave the template empty to derive the calendar URL from the CardDAV plugin
 settings instead.
+
+### Where a meeting is held
+
+An event has two places, and they are separate fields because a hybrid meeting
+genuinely has both:
+
+* **📍 Location** — somewhere to walk to. Stored as `LOCATION`, plus `GEO` when
+  the place was picked from the map rather than typed.
+* **📹 Video call** — somewhere to click. Stored as `CONFERENCE` (RFC 7986), the
+  property a conforming client reads to offer a Join button. When there is no
+  physical location, the link is copied into `LOCATION` as well, because plenty
+  of clients still render nothing else; the plugin folds that back out again
+  when it reads the event, so the field does not fill up with its own URL.
+
+**📹 mints a room.** The name is 80 bits from the server's CSPRNG, grouped into
+fours so it can be read out loud. It is deliberately not derived from the event
+title: on a public Jitsi deployment the room name *is* the access control, and a
+title-derived room would let anyone who can guess what you call your meetings
+walk into them. Replacing an existing link asks first, since guests may already
+be holding the old one.
+
+**🌐 finds a place.** It searches the configured geocoder and fills in the
+address and coordinates. Note what it is not: an embedded map. SnappyMail serves
+this page under a CSP of roughly `script-src 'self'`, which blocks an
+OpenStreetMap or Google iframe and any CDN-loaded map library, and a real popup
+window on `openstreetmap.org` cannot hand a selection back across origins. The
+lookup is therefore proxied through PHP — which also keeps the user's IP out of
+the geocoder's logs, and lets the plugin send the identifying `User-Agent`
+Nominatim's usage policy asks for and a browser will not let it set. Read that
+policy before pointing a busy installation at the public instance; run your own
+Nominatim if in doubt. Either field can always be typed by hand.
 
 ### Attendee completion and who can be found
 

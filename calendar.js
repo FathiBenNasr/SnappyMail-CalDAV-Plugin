@@ -166,6 +166,24 @@ cal.innerHTML = `
 .event-organizer-value { padding: 8px 0; opacity: .85; }
 .event-modal-btn-warning { background: #c77700; color: white; }
 .event-modal-btn-warning:hover { background: #a66300; }
+
+/* A field with an action hanging off it: location + map, video call + new room */
+.event-field-row { display: flex; gap: 8px; align-items: stretch; }
+.event-field-row .event-form-input { flex: 1 1 auto; min-width: 0; }
+.event-icon-btn { flex: 0 0 auto; width: 42px; border: 1px solid var(--cal-border); border-radius: 6px; background: var(--cal-bg-tertiary); color: var(--cal-text-primary); font-size: 18px; line-height: 1; cursor: pointer; transition: all 0.2s; }
+.event-icon-btn:hover { background: var(--cal-accent); border-color: var(--cal-accent); transform: translateY(-1px); }
+.event-icon-btn:disabled { opacity: .5; cursor: default; transform: none; }
+.event-field-hint { display: block; margin-top: 6px; font-size: 12px; opacity: .75; }
+.event-field-hint a { color: var(--cal-accent); }
+
+/* Place picker */
+.place-search-row { display: flex; gap: 8px; }
+.place-results { margin-top: 12px; max-height: 320px; overflow-y: auto; border: 1px solid var(--cal-border); border-radius: 6px; }
+.place-results:empty { display: none; }
+.place-result { padding: 10px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--cal-border); }
+.place-result:last-child { border-bottom: none; }
+.place-result:hover, .place-result.is-active { background: var(--cal-bg-tertiary); }
+.place-status { margin-top: 12px; font-size: 13px; opacity: .75; }
 </style>
 <div class="cal-wrapper">
 <div class="cal-main">
@@ -213,8 +231,24 @@ cal.innerHTML = `
 					</label>
 				</div>
 				<div class="event-form-group">
-					<label class="event-form-label">Location</label>
-					<input type="text" class="event-form-input" id="event-location" placeholder="Add location">
+					<label class="event-form-label" for="event-location">📍 Location</label>
+					<div class="event-field-row">
+						<input type="text" class="event-form-input" id="event-location" placeholder="Where to go - leave empty if it is online only">
+						<button type="button" class="event-icon-btn" id="event-location-pick-btn"
+							title="Find this place on the map" aria-label="Find this place on the map"
+							style="display:none;">🌐</button>
+					</div>
+					<small class="event-field-hint" id="event-location-hint" style="display:none;"></small>
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="event-conference">📹 Video call</label>
+					<div class="event-field-row">
+						<input type="url" class="event-form-input" id="event-conference" placeholder="https://... - or click the camera for a new room">
+						<button type="button" class="event-icon-btn" id="event-conference-btn"
+							title="Create a video meeting room" aria-label="Create a video meeting room"
+							style="display:none;">📹</button>
+					</div>
+					<small class="event-field-hint" id="event-conference-hint" style="display:none;"></small>
 				</div>
 				<div class="event-form-group" id="event-organizer-row" style="display:none;">
 					<label class="event-form-label">Organizer</label>
@@ -249,6 +283,27 @@ cal.innerHTML = `
 			<button class="event-modal-btn event-modal-btn-warning" id="event-cancel-meeting-btn" style="display:none;" title="Tell the guests it is off, then remove it">Cancel meeting</button>
 			<button class="event-modal-btn event-modal-btn-secondary">Cancel</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="event-save-btn">Save Event</button>
+		</div>
+	</div>
+</div>
+
+<div class="event-modal-overlay" id="place-picker-modal">
+	<div class="event-modal">
+		<div class="event-modal-header">
+			<h3 class="event-modal-title">🌐 Find a place</h3>
+			<button class="event-modal-close" id="place-picker-close">×</button>
+		</div>
+		<div class="event-modal-body">
+			<div class="place-search-row">
+				<input type="text" class="event-form-input" id="place-query"
+					placeholder="Street, place or town" autocomplete="off">
+				<button type="button" class="event-modal-btn event-modal-btn-primary" id="place-search-btn">Search</button>
+			</div>
+			<div class="place-status" id="place-status"></div>
+			<div class="place-results" id="place-results"></div>
+		</div>
+		<div class="event-modal-footer">
+			<button class="event-modal-btn event-modal-btn-secondary" id="place-picker-cancel">Cancel</button>
 		</div>
 	</div>
 </div>
@@ -303,6 +358,39 @@ cal.innerHTML = `
 		// Modal delete button
 		const deleteBtn = document.getElementById('event-delete-btn');
 		if (deleteBtn) deleteBtn.addEventListener('click', deleteEventFromModal);
+
+		// Mint a room, and find a place. Both buttons stay hidden until the
+		// server says the deployment has somewhere to point them at.
+		const confBtn = document.getElementById('event-conference-btn');
+		if (confBtn) confBtn.addEventListener('click', mintConferenceUrl);
+
+		const placeBtn = document.getElementById('event-location-pick-btn');
+		if (placeBtn) placeBtn.addEventListener('click', openPlacePicker);
+
+		const locInput = document.getElementById('event-location');
+		if (locInput) locInput.addEventListener('input', () => {
+			// Typed by hand, so the coordinates the picker left behind no longer
+			// describe it. Better no pin than a pin on the wrong building.
+			currentEventGeo = '';
+			refreshFieldHints();
+		});
+		const confInput = document.getElementById('event-conference');
+		if (confInput) confInput.addEventListener('input', refreshFieldHints);
+
+		const placeSearchBtn = document.getElementById('place-search-btn');
+		if (placeSearchBtn) placeSearchBtn.addEventListener('click', runPlaceSearch);
+		const placeQuery = document.getElementById('place-query');
+		if (placeQuery) placeQuery.addEventListener('keydown', (e) => {
+			if ('Enter' === e.key) { e.preventDefault(); runPlaceSearch(); }
+		});
+		['place-picker-close', 'place-picker-cancel'].forEach(id => {
+			const el = document.getElementById(id);
+			if (el) el.addEventListener('click', closePlacePicker);
+		});
+		const placeOverlay = document.getElementById('place-picker-modal');
+		if (placeOverlay) placeOverlay.addEventListener('click', (e) => {
+			if (e.target === placeOverlay) closePlacePicker();
+		});
 
 		// Cancelling a meeting is not deleting it: the guests have to be told.
 		const cancelMeetingBtn = document.getElementById('event-cancel-meeting-btn');
@@ -389,6 +477,8 @@ function openEventModal(eventData = null, fcEvent = null) {
 		document.getElementById('event-title').value = eventData.title || '';
 		document.getElementById('event-allday').checked = isAllDay;
 		document.getElementById('event-location').value = eventData.location || '';
+		document.getElementById('event-conference').value = eventData.conference || '';
+		currentEventGeo = eventData.geo || '';
 		document.getElementById('event-description').value = eventData.description || '';
 		document.getElementById('event-reminder').value = eventData.reminder || '';
 		const att = document.getElementById('event-attendees');
@@ -429,6 +519,7 @@ function openEventModal(eventData = null, fcEvent = null) {
 		const orgRowNew = document.getElementById('event-organizer-row');
 		if (orgRowNew) orgRowNew.style.display = 'none';
 		document.getElementById('event-form').reset();
+		currentEventGeo = '';
 		const now = new Date();
 		const end = new Date(now.getTime() + 3600000); // 1 hour later
 		// Set input type to datetime-local first to ensure time picker is visible
@@ -441,6 +532,8 @@ function openEventModal(eventData = null, fcEvent = null) {
 		toggleTimeInputs(false);
 	}
 	
+	applyFeatureToggles();
+	refreshFieldHints();
 	modal.classList.add('show');
 }
 
@@ -508,6 +601,7 @@ function saveEventFromModal() {
 	const end = document.getElementById('event-end').value;
 	const allDay = document.getElementById('event-allday').checked;
 	const location = document.getElementById('event-location').value.trim();
+	const conference = (document.getElementById('event-conference') || {}).value || '';
 	let description = document.getElementById('event-description').value.trim();
 	const reminder = document.getElementById('event-reminder').value;
 	const attendees = (document.getElementById('event-attendees') || {}).value || '';
@@ -540,11 +634,13 @@ function saveEventFromModal() {
 		end: endDate,
 		allDay,
 		location,
+		conference: conference.trim(),
+		geo: currentEventGeo,
 		description,
 		reminder: parseInt(reminder) || 0,
 		attendees: attendees
 	};
-	
+
 	if (currentEditingEvent) {
 		// Update existing event
 		currentEditingEvent.setProp('title', title);
@@ -553,6 +649,8 @@ function saveEventFromModal() {
 		currentEditingEvent.setAllDay(allDay);
 		currentEditingEvent.setExtendedProp('attendees', eventData.attendees || '');
 		currentEditingEvent.setExtendedProp('location', eventData.location || '');
+		currentEditingEvent.setExtendedProp('conference', eventData.conference || '');
+		currentEditingEvent.setExtendedProp('geo', eventData.geo || '');
 		currentEditingEvent.setExtendedProp('description', eventData.description || '');
 		updateEvent(currentEditingEvent);
 	} else {
@@ -625,6 +723,186 @@ function deleteEventFromModal() {
 		document.getElementById('event-modal').classList.remove('show');
 		currentEditingEvent = null;
 	}
+}
+
+/* ------------------------------------------------------------------ *
+ * Where the meeting is: a room, a call, or both
+ *
+ * Two fields rather than one overloaded "Location", because a hybrid
+ * meeting has both a place to walk to and a link to click, and squashing
+ * them into one line loses whichever the writer cared about less.
+ *
+ * The camera mints a room on the server (a CSPRNG the browser does not
+ * have, and the meeting server URL stays a deployment setting). The globe
+ * searches a geocoder, also on the server: this page runs under a CSP that
+ * blocks an embedded map, and a popup on openstreetmap.org could not hand
+ * a selection back across origins anyway.
+ * ------------------------------------------------------------------ */
+let calFeatures = { conference: false, places: false };
+// Coordinates for whatever is in the location field, when the picker put it
+// there. Kept out of the DOM so hand-typing the field can drop it.
+let currentEventGeo = '';
+
+function applyFeatureToggles() {
+	const confBtn = document.getElementById('event-conference-btn');
+	if (confBtn) confBtn.style.display = calFeatures.conference ? 'block' : 'none';
+	const placeBtn = document.getElementById('event-location-pick-btn');
+	if (placeBtn) placeBtn.style.display = calFeatures.places ? 'block' : 'none';
+}
+
+// A link is only worth showing once it is one.
+function asHttpUrl(value) {
+	const v = (value || '').trim();
+	return /^https?:\/\/\S+$/i.test(v) ? v : '';
+}
+
+function refreshFieldHints() {
+	const confHint = document.getElementById('event-conference-hint');
+	if (confHint) {
+		const url = asHttpUrl((document.getElementById('event-conference') || {}).value);
+		confHint.innerHTML = '';
+		if (url) {
+			const a = document.createElement('a');
+			a.href = url;
+			a.target = '_blank';
+			a.rel = 'noopener noreferrer';
+			a.textContent = 'Join the call';
+			confHint.appendChild(a);
+			confHint.append(' - guests get this link with the invitation.');
+			confHint.style.display = 'block';
+		} else {
+			confHint.style.display = 'none';
+		}
+	}
+
+	const locHint = document.getElementById('event-location-hint');
+	if (locHint) {
+		const loc = ((document.getElementById('event-location') || {}).value || '').trim();
+		locHint.innerHTML = '';
+		if (loc) {
+			const a = document.createElement('a');
+			// Coordinates when the picker found them, otherwise let the map
+			// search for the text - a pin beats a guess, a guess beats nothing.
+			a.href = currentEventGeo
+				? 'https://www.openstreetmap.org/?mlat=' + encodeURIComponent(currentEventGeo.split(';')[0])
+					+ '&mlon=' + encodeURIComponent(currentEventGeo.split(';')[1]) + '#map=17/'
+					+ encodeURIComponent(currentEventGeo.split(';')[0]) + '/'
+					+ encodeURIComponent(currentEventGeo.split(';')[1])
+				: 'https://www.openstreetmap.org/search?query=' + encodeURIComponent(loc);
+			a.target = '_blank';
+			a.rel = 'noopener noreferrer';
+			a.textContent = currentEventGeo ? 'Show on the map' : 'Look up on the map';
+			locHint.appendChild(a);
+			locHint.style.display = 'block';
+		} else {
+			locHint.style.display = 'none';
+		}
+	}
+}
+
+function mintConferenceUrl() {
+	const input = document.getElementById('event-conference');
+	const btn = document.getElementById('event-conference-btn');
+	if (!input || !rl.pluginRemoteRequest) return;
+
+	// Replacing a link the guests may already hold sends them somewhere the
+	// meeting is not, so that is asked about rather than assumed.
+	if (input.value.trim() && !confirm('Replace the current video link with a new room?\n\n'
+		+ 'Anyone already holding the old link will not reach this meeting.')) {
+		return;
+	}
+
+	if (btn) btn.disabled = true;
+	rl.pluginRemoteRequest((iError, oData) => {
+		if (btn) btn.disabled = false;
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success || !res.url) {
+			alert((res && res.error) || 'Could not create a meeting room.');
+			return;
+		}
+		input.value = res.url;
+		refreshFieldHints();
+	}, 'NewConferenceUrl', {});
+}
+
+function openPlacePicker() {
+	const modal = document.getElementById('place-picker-modal');
+	const query = document.getElementById('place-query');
+	if (!modal || !query) return;
+
+	const current = ((document.getElementById('event-location') || {}).value || '').trim();
+	query.value = current;
+	setPlaceStatus('');
+	renderPlaceResults([]);
+	modal.classList.add('show');
+	query.focus();
+	query.select();
+	if (current) runPlaceSearch();
+}
+
+function closePlacePicker() {
+	const modal = document.getElementById('place-picker-modal');
+	if (modal) modal.classList.remove('show');
+}
+
+function setPlaceStatus(text) {
+	const el = document.getElementById('place-status');
+	if (el) el.textContent = text || '';
+}
+
+function renderPlaceResults(places) {
+	const box = document.getElementById('place-results');
+	if (!box) return;
+	box.innerHTML = '';
+	places.forEach(place => {
+		const row = document.createElement('div');
+		row.className = 'place-result';
+		row.textContent = place.label;
+		row.addEventListener('click', () => choosePlace(place));
+		box.appendChild(row);
+	});
+}
+
+function choosePlace(place) {
+	const input = document.getElementById('event-location');
+	if (input) input.value = place.label || '';
+	currentEventGeo = (null !== place.lat && null !== place.lon && undefined !== place.lat)
+		? place.lat + ';' + place.lon
+		: '';
+	closePlacePicker();
+	refreshFieldHints();
+}
+
+function runPlaceSearch() {
+	const query = document.getElementById('place-query');
+	const btn = document.getElementById('place-search-btn');
+	if (!query || !rl.pluginRemoteRequest) return;
+
+	const q = query.value.trim();
+	if (2 > q.length) {
+		setPlaceStatus('Type at least two characters.');
+		return;
+	}
+
+	if (btn) btn.disabled = true;
+	setPlaceStatus('Searching...');
+	renderPlaceResults([]);
+
+	rl.pluginRemoteRequest((iError, oData) => {
+		if (btn) btn.disabled = false;
+		const res = oData && oData.Result;
+		if (iError || !res) {
+			setPlaceStatus('The search failed.');
+			return;
+		}
+		if (res.error) {
+			setPlaceStatus(res.error);
+			return;
+		}
+		const places = res.places || [];
+		setPlaceStatus(places.length ? '' : 'Nothing found. Try a wider search, or type the address by hand.');
+		renderPlaceResults(places);
+	}, 'SearchPlaces', { Query: q });
 }
 
 function hideCalendar() {
@@ -710,6 +988,8 @@ eventClick: function(info) {
 		end: event.end || event.start,
 		allDay: event.allDay,
 		location: event.extendedProps?.location || '',
+		conference: event.extendedProps?.conference || '',
+		geo: event.extendedProps?.geo || '',
 		description: event.extendedProps?.description || '',
 		reminder: event.extendedProps?.reminder || '',
 		attendees: event.extendedProps?.attendees || '',
@@ -774,6 +1054,8 @@ return;
 			classNames: ['modern-event'],
 			extendedProps: {
 				location: event.location || '',
+				conference: event.conference || '',
+				geo: event.geo || '',
 				description: event.description || '',
 				attendees: event.attendees || '',
 				organizer: event.organizer || '',
@@ -781,6 +1063,13 @@ return;
 			}
 		};
 	});
+
+	// Whether this deployment has a meeting server and a geocoder at all.
+	calFeatures = {
+		conference: !!result.conferenceEnabled,
+		places: !!result.placesEnabled
+	};
+	applyFeatureToggles();
 
 	calendarEvents = events;
 	scheduleReminders(result.events || []);
@@ -897,6 +1186,10 @@ function createEvent(eventData) {
 		AllDay: eventData.allDay || false,
 		Description: eventData.description || '',
 		Location: eventData.location || '',
+		// the video call, and the coordinates of the physical place if the
+		// picker found them; the server writes CONFERENCE and GEO
+		Conference: eventData.conference || '',
+		Geo: eventData.geo || '',
 		// minutes before start; the server turns this into a real VALARM
 		Reminder: eventData.reminder || 0,
 		// comma or semicolon separated; the calendar server mails the invitations
@@ -940,9 +1233,14 @@ function updateEvent(event) {
 		}
 		if (calendar) calendar.refetchEvents();
 	}, 'UpdateCalendarEvent', {
-		// omitted when unknown: the server only rewrites the guest list when
-		// this is present, so dragging an event cannot uninvite anyone
+		// omitted when unknown: the server only rewrites these when they are
+		// present, so dragging an event cannot uninvite anyone or blank out
+		// where it is being held
 		Attendees: event.extendedProps?.attendees,
+		Location: event.extendedProps?.location,
+		Conference: event.extendedProps?.conference,
+		Geo: event.extendedProps?.geo,
+		Description: event.extendedProps?.description,
 		EventId: eventId,
 		Title: event.title,
 		Start: startFormatted,

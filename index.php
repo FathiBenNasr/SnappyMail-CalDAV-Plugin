@@ -4,8 +4,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.3',
-		RELEASE  = '2026-08-16',
+		VERSION  = '2.4',
+		RELEASE  = '2026-08-17',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
 		REQUIRED = '2.0.0';
@@ -19,6 +19,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('DeleteCalendarEvent', 'DoDeleteCalendarEvent');
 		$this->addJsonHook('CancelCalendarEvent', 'DoCancelCalendarEvent');
 		$this->addJsonHook('SuggestAttendees', 'DoSuggestAttendees');
+		$this->addJsonHook('NewConferenceUrl', 'DoNewConferenceUrl');
+		$this->addJsonHook('SearchPlaces', 'DoSearchPlaces');
 		
 		// Serve this plugin's static assets. There is no built-in route for
 		// them: ServiceActions::ServicePlugins() ignores everything after
@@ -127,6 +129,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 
 			$sOldStart = (string) ($oEvent->DTSTART ?? '');
 			$sOldEnd   = (string) ($oEvent->DTEND ?? '');
+			$sOldWhere = (string) ($oEvent->LOCATION ?? '') . "\0" . $this->conferenceUri($oEvent);
 
 			$oEvent->SUMMARY = $sTitle;
 			$aDateParams = $bAllDay ? array('VALUE' => 'DATE') : array();
@@ -134,6 +137,56 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$oEvent->remove('DTEND');
 			$oEvent->add('DTSTART', $sStart, $aDateParams);
 			$oEvent->add('DTEND', $sEnd, $aDateParams);
+
+			// Where it is, and where the call is. Same rule as the guest list
+			// below: only touched when the dialog actually sent the field, so an
+			// edit that never saw it cannot blank it. This is also why editing
+			// the location used to have no effect - the dialog set it locally
+			// and nothing ever sent it here.
+			$mConference = $this->jsonParam('Conference', null);
+			if (null !== $mConference) {
+				$sConference = $this->sanitizeConferenceUrl((string) $mConference);
+				$oEvent->remove('CONFERENCE');
+				if (\strlen($sConference)) {
+					$oEvent->add('CONFERENCE', $sConference, array(
+						'VALUE'   => 'URI',
+						'FEATURE' => array('VIDEO', 'AUDIO'),
+						'LABEL'   => 'Video call'
+					));
+				}
+			} else {
+				$sConference = $this->conferenceUri($oEvent);
+			}
+
+			$mLocation = $this->jsonParam('Location', null);
+			if (null !== $mLocation) {
+				$sLocation = \trim((string) $mLocation);
+				$oEvent->remove('LOCATION');
+				if (\strlen($sLocation)) {
+					$oEvent->add('LOCATION', $sLocation);
+				} elseif (\strlen($sConference)) {
+					// Online-only, and for the clients that only render LOCATION.
+					$oEvent->add('LOCATION', $sConference);
+				}
+			}
+
+			$mGeo = $this->jsonParam('Geo', null);
+			if (null !== $mGeo) {
+				$sGeo = $this->sanitizeGeo((string) $mGeo);
+				$oEvent->remove('GEO');
+				if (\strlen($sGeo)) {
+					$oEvent->add('GEO', $sGeo);
+				}
+			}
+
+			$mDescription = $this->jsonParam('Description', null);
+			if (null !== $mDescription) {
+				$sDescription = (string) $mDescription;
+				$oEvent->remove('DESCRIPTION');
+				if (\strlen(\trim($sDescription))) {
+					$oEvent->add('DESCRIPTION', $sDescription);
+				}
+			}
 
 			// Only touch the guest list when the dialog actually sent one, so an
 			// edit that leaves the field alone does not silently uninvite people.
@@ -173,8 +226,11 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 
 			// SEQUENCE must advance on a change attendees need to hear about
 			// (RFC 5545 3.8.7.4), otherwise their clients ignore the update.
+			// Moving a meeting to a different room, or on to a different call,
+			// is exactly such a change.
+			$sNewWhere = (string) ($oEvent->LOCATION ?? '') . "\0" . $this->conferenceUri($oEvent);
 			if ($bGuestsChanged || $sOldStart !== (string) $oEvent->DTSTART
-			 || $sOldEnd !== (string) $oEvent->DTEND) {
+			 || $sOldEnd !== (string) $oEvent->DTEND || $sOldWhere !== $sNewWhere) {
 				$oEvent->SEQUENCE = ((int) ((string) ($oEvent->SEQUENCE ?? '0'))) + 1;
 			}
 			$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
@@ -316,6 +372,225 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		return true;
 	}
 
+	/* ------------------------------------------------------------------ *
+	 * Video conferencing
+	 *
+	 * A meeting has two places: where the room is, and where the call is.
+	 * They are kept as separate fields rather than one overloaded LOCATION,
+	 * because a hybrid meeting genuinely has both and squashing them loses
+	 * one of them. LOCATION stays the physical place; the call goes in
+	 * CONFERENCE (RFC 7986 5.11), which is what a conforming client reads to
+	 * offer a Join button.
+	 * ------------------------------------------------------------------ */
+
+	/**
+	 * The configured meeting server, or '' when the feature is off.
+	 */
+	private function conferenceBaseUrl() : string
+	{
+		$sUrl = \trim((string) $this->Config()->Get('plugin', 'jitsi_url', ''));
+		return \preg_match('#^https?://#i', $sUrl) ? \rtrim($sUrl, '/') : '';
+	}
+
+	/**
+	 * A room nobody can guess.
+	 *
+	 * On a public Jitsi deployment the room name IS the access control: anyone
+	 * who can guess it is in the meeting. So this is 80 bits from the CSPRNG,
+	 * not a slug of the event title - a title-derived room would let anyone
+	 * who knows what you call your meetings walk into them. Grouped into
+	 * fours only so it can be read out over the phone; the ambiguous
+	 * characters are left out of the alphabet for the same reason.
+	 */
+	private function generateRoomName() : string
+	{
+		$sAlphabet = 'abcdefghijkmnopqrstuvwxyz23456789';
+		$iMax = \strlen($sAlphabet) - 1;
+		$aGroups = array();
+		for ($iGroup = 0; $iGroup < 4; ++$iGroup) {
+			$sGroup = '';
+			for ($iChar = 0; $iChar < 4; ++$iChar) {
+				$sGroup .= $sAlphabet[\random_int(0, $iMax)];
+			}
+			$aGroups[] = $sGroup;
+		}
+		return \implode('-', $aGroups);
+	}
+
+	/**
+	 * Mint a fresh room URL for the event dialog.
+	 *
+	 * Done here rather than in the browser so the room name comes from a real
+	 * CSPRNG - Math.random() is not one - and so the server URL stays a
+	 * deployment setting instead of being published to every page.
+	 */
+	public function DoNewConferenceUrl() : array
+	{
+		$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+		if (!$oAccount) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Not logged in']);
+		}
+
+		$sBase = $this->conferenceBaseUrl();
+		if (!\strlen($sBase)) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false,
+				'error' => 'No video meeting server is configured for this installation.']);
+		}
+
+		return $this->jsonResponse(__FUNCTION__, [
+			'success' => true,
+			'url' => $sBase . '/' . $this->generateRoomName()
+		]);
+	}
+
+	/**
+	 * Accept a conference link only if it is one. Anything else - a javascript:
+	 * URI, a stray line break that would forge an iCalendar property - is not
+	 * something to write into an event other people's clients will open.
+	 */
+	private function sanitizeConferenceUrl(string $sUrl) : string
+	{
+		// Note the anchors and \s: a value carrying a line break is rejected
+		// outright rather than having the break stripped, which would silently
+		// weld a forged iCalendar property onto the end of the URL.
+		$sUrl = \trim($sUrl);
+		return \preg_match('#^https?://[^\s<>"]+$#i', $sUrl) ? $sUrl : '';
+	}
+
+	/**
+	 * Fold a property to the 75-octet lines RFC 5545 3.1 asks for. A generated
+	 * room URL plus a long server name clears that on its own, and an unfolded
+	 * line is the kind of thing a strict parser on the guest's side rejects.
+	 */
+	private function foldICSLine(string $sLine) : string
+	{
+		if (75 >= \strlen($sLine)) {
+			return $sLine;
+		}
+
+		// The limit is counted in octets, but a fold may not cut a UTF-8
+		// character in half, so the line is walked character by character.
+		$aChars = \preg_split('//u', $sLine, -1, PREG_SPLIT_NO_EMPTY);
+		if (!\is_array($aChars)) {
+			return $sLine;   // not valid UTF-8: leave it rather than corrupt it
+		}
+
+		$sOut = '';
+		$iOctets = 0;
+		foreach ($aChars as $sChar) {
+			$iWidth = \strlen($sChar);
+			if (75 < $iOctets + $iWidth) {
+				$sOut .= "\r\n ";
+				$iOctets = 1;   // the leading space of a continuation line counts
+			}
+			$sOut .= $sChar;
+			$iOctets += $iWidth;
+		}
+		return $sOut;
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * Picking a physical place
+	 *
+	 * The map lives behind a search box rather than an embedded map widget.
+	 * SnappyMail ships a Content-Security-Policy of roughly script-src 'self',
+	 * so neither an OpenStreetMap/Google iframe nor a CDN-loaded Leaflet will
+	 * run in this page, and a real popup window on openstreetmap.org cannot
+	 * hand its selection back across origins. What does work is asking a
+	 * geocoder ourselves and letting the organiser pick from the answers.
+	 *
+	 * The lookup is proxied through PHP for three reasons: connect-src would
+	 * block the browser making it, Nominatim's usage policy wants a
+	 * identifying User-Agent that a browser will not let us set, and it keeps
+	 * the user's IP out of a third party's logs.
+	 * ------------------------------------------------------------------ */
+
+	private function geocoderUrl() : string
+	{
+		$sUrl = \trim((string) $this->Config()->Get('plugin', 'geocoder_url', ''));
+		return \preg_match('#^https?://#i', $sUrl) ? \rtrim($sUrl, '/') : '';
+	}
+
+	/**
+	 * Look a place up. Returns at most a handful of candidates, each with a
+	 * label to show and coordinates to store.
+	 */
+	public function DoSearchPlaces() : array
+	{
+		$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+		if (!$oAccount) {
+			return $this->jsonResponse(__FUNCTION__, ['places' => [], 'error' => 'Not logged in']);
+		}
+
+		$sBase = $this->geocoderUrl();
+		if (!\strlen($sBase)) {
+			return $this->jsonResponse(__FUNCTION__, ['places' => [],
+				'error' => 'No geocoder is configured for this installation.']);
+		}
+
+		$sQuery = \trim((string) $this->jsonParam('Query', ''));
+		if (2 > \strlen($sQuery)) {
+			return $this->jsonResponse(__FUNCTION__, ['places' => []]);
+		}
+
+		$sUrl = $sBase . '/search?format=jsonv2&addressdetails=0&limit=8&q=' . \rawurlencode($sQuery);
+
+		$oCurl = \curl_init($sUrl);
+		\curl_setopt($oCurl, CURLOPT_RETURNTRANSFER, true);
+		\curl_setopt($oCurl, CURLOPT_SSL_VERIFYPEER, true);
+		\curl_setopt($oCurl, CURLOPT_TIMEOUT, 10);
+		\curl_setopt($oCurl, CURLOPT_FOLLOWLOCATION, false);
+		// Nominatim's policy requires an identifying User-Agent and will hand
+		// out 403s without one. A browser cannot set this header itself, which
+		// is the other half of why the call is made here.
+		\curl_setopt($oCurl, CURLOPT_USERAGENT,
+			'SnappyMail-CalDAV-Plugin/' . self::VERSION . ' (calendar location picker)');
+		\curl_setopt($oCurl, CURLOPT_HTTPHEADER, ['Accept: application/json']);
+		$sBody = \curl_exec($oCurl);
+		$iCode = (int) \curl_getinfo($oCurl, CURLINFO_HTTP_CODE);
+		\curl_close($oCurl);
+
+		if (200 !== $iCode || !\is_string($sBody)) {
+			return $this->jsonResponse(__FUNCTION__, ['places' => [],
+				'error' => 'The geocoder did not answer (HTTP ' . $iCode . ').']);
+		}
+
+		$aRaw = \json_decode($sBody, true);
+		if (!\is_array($aRaw)) {
+			return $this->jsonResponse(__FUNCTION__, ['places' => [], 'error' => 'Unreadable geocoder answer.']);
+		}
+
+		$aPlaces = array();
+		foreach ($aRaw as $aItem) {
+			if (!\is_array($aItem) || !isset($aItem['display_name'])) {
+				continue;
+			}
+			$aPlaces[] = array(
+				'label' => (string) $aItem['display_name'],
+				'lat'   => isset($aItem['lat']) ? (float) $aItem['lat'] : null,
+				'lon'   => isset($aItem['lon']) ? (float) $aItem['lon'] : null
+			);
+		}
+
+		return $this->jsonResponse(__FUNCTION__, ['places' => $aPlaces]);
+	}
+
+	/**
+	 * "lat;lon" as iCalendar wants it in GEO, or '' if it is not a coordinate.
+	 */
+	private function sanitizeGeo(string $sGeo) : string
+	{
+		if (!\preg_match('#^(-?\d{1,3}(?:\.\d+)?)[;,](-?\d{1,3}(?:\.\d+)?)$#', \trim($sGeo), $aMatch)) {
+			return '';
+		}
+		$fLat = (float) $aMatch[1];
+		$fLon = (float) $aMatch[2];
+		if (-90 > $fLat || 90 < $fLat || -180 > $fLon || 180 < $fLon) {
+			return '';
+		}
+		return $aMatch[1] . ';' . $aMatch[2];
+	}
+
 	/**
 	 * Plugin configuration mapping
 	 */
@@ -369,6 +644,26 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					. ' let any user enumerate the others addresses. Off restricts'
 					. ' completion to the user\'s own address book.')
 				->SetDefaultValue(true),
+			\RainLoop\Plugins\Property::NewInstance('jitsi_url')
+				->SetLabel('Video meeting server URL')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
+				->SetDescription('Base URL of a Jitsi Meet (or compatible) server, e.g.'
+					. ' https://meet.jit.si or https://meet.example.com. The event dialog'
+					. ' then offers a video-call field with a button that mints a random,'
+					. ' unguessable room under this URL. Leave empty to hide that button;'
+					. ' an organiser can still paste a link from any other tool by hand.')
+				->SetDefaultValue(''),
+			\RainLoop\Plugins\Property::NewInstance('geocoder_url')
+				->SetLabel('Geocoder URL (location picker)')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
+				->SetDescription('Base URL of a Nominatim-compatible geocoder, e.g.'
+					. ' https://nominatim.openstreetmap.org. Enables the globe button beside'
+					. ' the location field, which searches for a place and fills in its address'
+					. ' and coordinates. Lookups are made by this server, not the browser.'
+					. ' Before pointing this at the public OpenStreetMap instance, read its'
+					. ' usage policy - a busy installation should run its own. Leave empty to'
+					. ' hide the button; the location field stays free text either way.')
+				->SetDefaultValue(''),
 			\RainLoop\Plugins\Property::NewInstance('auto_sync')
 				->SetLabel('Auto Sync')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)
@@ -669,6 +964,23 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * Returns null when VObject cannot handle the payload, so the caller falls
 	 * back to the original line-based parser.
 	 */
+	/**
+	 * The video call attached to an event, if any: the first CONFERENCE that
+	 * is actually a usable link.
+	 */
+	private function conferenceUri($oEvent) : string
+	{
+		if (isset($oEvent->CONFERENCE)) {
+			foreach ($oEvent->CONFERENCE as $oConference) {
+				$sUrl = $this->sanitizeConferenceUrl((string) $oConference);
+				if (\strlen($sUrl)) {
+					return $sUrl;
+				}
+			}
+		}
+		return '';
+	}
+
 	private function parseICalendarVObject($icalData, string $sSelf = '')
 	{
 		if (!\class_exists('\\Sabre\\VObject\\Reader')) {
@@ -722,13 +1034,28 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					$oEndDt = $oEnd ? $oEnd->getDateTime() : $oDtStart->getDateTime();
 				}
 				$sFmt = $bAllDay ? 'Y-m-d' : 'c';
+
+				// Where the call is, and where the room is. Clients that have
+				// only one field for both put the link in LOCATION, so that is
+				// read as a conference rather than shown as a place to walk to.
+				$sConference = $this->conferenceUri($oEvent);
+				$sLocation = \trim((string) ($oEvent->LOCATION ?? ''));
+				if (!\strlen($sConference) && \preg_match('#^https?://\S+$#i', $sLocation)) {
+					$sConference = $sLocation;
+				}
+				if (\strlen($sConference) && 0 === \strcasecmp($sLocation, $sConference)) {
+					$sLocation = '';
+				}
+
 				$aResult[] = [
 					'uid'         => (string) ($oEvent->UID ?? ''),
 					'summary'     => (string) ($oEvent->SUMMARY ?? 'Untitled'),
 					'dtstart'     => $oDtStart->getDateTime()->format($sFmt),
 					'dtend'       => $oEndDt->format($sFmt),
 					'description' => (string) ($oEvent->DESCRIPTION ?? ''),
-					'location'    => (string) ($oEvent->LOCATION ?? ''),
+					'location'    => $sLocation,
+					'conference'  => $sConference,
+					'geo'         => $this->sanitizeGeo((string) ($oEvent->GEO ?? '')),
 					'allDay'      => $bAllDay,
 					'attendees'   => $this->listAttendees($oEvent),
 					'organizer'   => $this->organizerLabel($oEvent),
@@ -778,6 +1105,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					'dtend' => $this->parseICalDate($currentEvent['dtend'] ?? ''),
 					'description' => $currentEvent['description'] ?? '',
 					'location' => $currentEvent['location'] ?? '',
+					'conference' => $this->sanitizeConferenceUrl($currentEvent['conference'] ?? ''),
 					'allDay' => !isset($currentEvent['dtstart']) || strpos($currentEvent['dtstart'], 'T') === false,
 					'organizer' => \preg_replace('#^mailto:#i', '', $currentEvent['organizer'] ?? ''),
 					'isOrganizer' => \strlen($sSelf) && 0 === \strcasecmp(
@@ -887,7 +1215,14 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			} else {
 			}
 			
-			return $this->jsonResponse(__FUNCTION__, ['events' => $aEvents, 'message' => 'Loaded ' . count($aEvents) . ' events']);
+			return $this->jsonResponse(__FUNCTION__, [
+				'events' => $aEvents,
+				// Whether the dialog should offer to mint a room, and to look a
+				// place up, at all.
+				'conferenceEnabled' => \strlen($this->conferenceBaseUrl()) > 0,
+				'placesEnabled' => \strlen($this->geocoderUrl()) > 0,
+				'message' => 'Loaded ' . count($aEvents) . ' events'
+			]);
 			
 		} catch (\Exception $e) {
 			return $this->jsonResponse(__FUNCTION__, ['events' => [], 'error' => $e->getMessage()]);
@@ -976,10 +1311,31 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sICS .= "SUMMARY:" . $this->escapeICS($sTitle) . "\r\n";
 			
 			if (!empty($sDescription)) {
-				$sICS .= "DESCRIPTION:" . $this->escapeICS($sDescription) . "\r\n";
+				$sICS .= $this->foldICSLine("DESCRIPTION:" . $this->escapeICS($sDescription)) . "\r\n";
 			}
+
+			// A meeting can be in a room, in a call, or both. The physical place
+			// stays in LOCATION; the call goes in CONFERENCE, where a client
+			// knows to offer it as a Join button rather than as an address.
+			$sConference = $this->sanitizeConferenceUrl((string) $this->jsonParam('Conference', ''));
 			if (!empty($sLocation)) {
-				$sICS .= "LOCATION:" . $this->escapeICS($sLocation) . "\r\n";
+				$sICS .= $this->foldICSLine("LOCATION:" . $this->escapeICS($sLocation)) . "\r\n";
+			} elseif (\strlen($sConference)) {
+				// Online-only: plenty of clients still show nothing but LOCATION,
+				// so the link goes there too rather than being invisible to them.
+				// parseICalendarVObject() folds it back out again on the way in.
+				$sICS .= $this->foldICSLine("LOCATION:" . $this->escapeICS($sConference)) . "\r\n";
+			}
+			if (\strlen($sConference)) {
+				$sICS .= $this->foldICSLine('CONFERENCE;VALUE=URI;FEATURE=VIDEO,AUDIO;'
+					. 'LABEL="Video call":' . $sConference) . "\r\n";
+			}
+
+			// Coordinates from the place picker, so every other client can put
+			// the meeting on a map without re-guessing the address.
+			$sGeo = $this->sanitizeGeo((string) $this->jsonParam('Geo', ''));
+			if (\strlen($sGeo)) {
+				$sICS .= "GEO:" . $sGeo . "\r\n";
 			}
 
 			// Inviting someone turns this into a scheduling object: it needs an
