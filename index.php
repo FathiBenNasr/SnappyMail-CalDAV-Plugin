@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.4',
+		VERSION  = '2.5',
 		RELEASE  = '2026-08-17',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -512,6 +512,15 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 
 	/**
+	 * Where to look when the geocoder above has never heard of the place.
+	 */
+	private function geocoderFallbackUrl() : string
+	{
+		$sUrl = \trim((string) $this->Config()->Get('plugin', 'geocoder_fallback_url', ''));
+		return \preg_match('#^https?://#i', $sUrl) ? \rtrim($sUrl, '/') : '';
+	}
+
+	/**
 	 * Look a place up. Returns at most a handful of candidates, each with a
 	 * label to show and coordinates to store.
 	 */
@@ -533,7 +542,44 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			return $this->jsonResponse(__FUNCTION__, ['places' => []]);
 		}
 
+		$sLanguages = $this->requestLanguages();
+		$aPlaces = $this->queryGeocoder($sBase, $sQuery, $sLanguages);
+
+		// A local geocoder is usually a country extract, so a meeting abroad
+		// finds nothing at all - searching Paris against a Tunisia import
+		// returns a street in Fouchana, or nothing. Falling back keeps the
+		// common case local and fast while still answering the rare one.
+		$bFellBack = false;
+		$sFallback = $this->geocoderFallbackUrl();
+		if (!$aPlaces && \strlen($sFallback) && 0 !== \strcasecmp($sFallback, $sBase)) {
+			$aFallbackPlaces = $this->queryGeocoder($sFallback, $sQuery, $sLanguages);
+			if ($aFallbackPlaces) {
+				$aPlaces = $aFallbackPlaces;
+				$bFellBack = true;
+			} elseif (null === $aPlaces && null !== $aFallbackPlaces) {
+				$aPlaces = $aFallbackPlaces;   // primary broke, fallback merely empty
+			}
+		}
+
+		if (null === $aPlaces) {
+			return $this->jsonResponse(__FUNCTION__, ['places' => [],
+				'error' => 'The geocoder did not answer.']);
+		}
+
+		return $this->jsonResponse(__FUNCTION__, ['places' => $aPlaces, 'fallback' => $bFellBack]);
+	}
+
+	/**
+	 * One geocoder, one query. Returns the candidates, or null when the
+	 * geocoder could not be reached or made no sense - which the caller has to
+	 * tell apart from an honest "no such place".
+	 */
+	private function queryGeocoder(string $sBase, string $sQuery, string $sLanguages) : ?array
+	{
 		$sUrl = $sBase . '/search?format=jsonv2&addressdetails=0&limit=8&q=' . \rawurlencode($sQuery);
+		if (\strlen($sLanguages)) {
+			$sUrl .= '&accept-language=' . \rawurlencode($sLanguages);
+		}
 
 		$oCurl = \curl_init($sUrl);
 		\curl_setopt($oCurl, CURLOPT_RETURNTRANSFER, true);
@@ -551,13 +597,14 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		\curl_close($oCurl);
 
 		if (200 !== $iCode || !\is_string($sBody)) {
-			return $this->jsonResponse(__FUNCTION__, ['places' => [],
-				'error' => 'The geocoder did not answer (HTTP ' . $iCode . ').']);
+			\SnappyMail\Log::notice('CalDAV', 'geocoder ' . $sBase . ' answered HTTP ' . $iCode);
+			return null;
 		}
 
 		$aRaw = \json_decode($sBody, true);
 		if (!\is_array($aRaw)) {
-			return $this->jsonResponse(__FUNCTION__, ['places' => [], 'error' => 'Unreadable geocoder answer.']);
+			\SnappyMail\Log::notice('CalDAV', 'geocoder ' . $sBase . ' returned unreadable JSON');
+			return null;
 		}
 
 		$aPlaces = array();
@@ -572,7 +619,26 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			);
 		}
 
-		return $this->jsonResponse(__FUNCTION__, ['places' => $aPlaces]);
+		return $aPlaces;
+	}
+
+	/**
+	 * The languages this user reads, for the geocoder to name places in.
+	 *
+	 * Without it Nominatim answers in whatever the locals call the place -
+	 * "شارع الحبيب بورقيبة" rather than "Avenue Habib Bourguiba" - which is
+	 * correct and frequently not what the organiser typed or wants to read.
+	 * The browser already states the preference, so it is passed on rather
+	 * than guessed at or made another setting.
+	 *
+	 * It leaves this server in a request to a third party, so only the shape
+	 * RFC 9110 5.3.5 describes is forwarded, and only the first 200 bytes of
+	 * it.
+	 */
+	private function requestLanguages() : string
+	{
+		$sLanguages = \trim(\substr((string) ($_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? ''), 0, 200));
+		return \preg_match('#^[A-Za-z0-9,;=.*\-\x20]+$#', $sLanguages) ? $sLanguages : '';
 	}
 
 	/**
@@ -663,6 +729,15 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					. ' Before pointing this at the public OpenStreetMap instance, read its'
 					. ' usage policy - a busy installation should run its own. Leave empty to'
 					. ' hide the button; the location field stays free text either way.')
+				->SetDefaultValue(''),
+			\RainLoop\Plugins\Property::NewInstance('geocoder_fallback_url')
+				->SetLabel('Geocoder fallback URL')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::STRING)
+				->SetDescription('Consulted only when the geocoder above finds nothing, e.g.'
+					. ' https://nominatim.openstreetmap.org. A self-hosted geocoder is usually'
+					. ' a single-country extract, so a meeting abroad finds nothing at all;'
+					. ' this keeps the common case local while still answering the rare one.'
+					. ' Leave empty for no fallback.')
 				->SetDefaultValue(''),
 			\RainLoop\Plugins\Property::NewInstance('auto_sync')
 				->SetLabel('Auto Sync')

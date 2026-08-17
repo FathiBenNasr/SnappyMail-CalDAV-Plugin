@@ -900,7 +900,11 @@ function runPlaceSearch() {
 			return;
 		}
 		const places = res.places || [];
-		setPlaceStatus(places.length ? '' : 'Nothing found. Try a wider search, or type the address by hand.');
+		setPlaceStatus(places.length
+			// Worth saying: it explains both the pause and why these results
+			// look different from the usual local ones.
+			? (res.fallback ? 'Not in the local map data - found further afield.' : '')
+			: 'Nothing found. Try a wider search, or type the address by hand.');
 		renderPlaceResults(places);
 	}, 'SearchPlaces', { Query: q });
 }

@@ -117,7 +117,8 @@ Admin → Plugins → caldav:
 | DAV default domain | `example.com` — addresses in this domain use the local part only, matching Cyrus `virtdomains: userid`; leave empty to always use the full address |
 | Complete attendees from the whole directory | Off by default |
 | Video meeting server URL | `https://meet.example.com` — empty hides the camera button |
-| Geocoder URL (location picker) | `https://nominatim.openstreetmap.org` — empty hides the globe button |
+| Geocoder URL (location picker) | `http://127.0.0.1:8091` — empty hides the globe button |
+| Geocoder fallback URL | `https://nominatim.openstreetmap.org` — consulted only when the first finds nothing |
 
 Leave the template empty to derive the calendar URL from the CardDAV plugin
 settings instead.
@@ -152,6 +153,20 @@ the geocoder's logs, and lets the plugin send the identifying `User-Agent`
 Nominatim's usage policy asks for and a browser will not let it set. Read that
 policy before pointing a busy installation at the public instance; run your own
 Nominatim if in doubt. Either field can always be typed by hand.
+
+A self-hosted geocoder is normally a single-country extract, so a meeting abroad
+finds nothing at all — searching *Eiffel Tower* against a Tunisia import returns
+nothing, and *Paris* returns a street in Fouchana. Setting the **fallback** to a
+wider geocoder covers that: it is consulted only when the first found nothing, so
+the common case stays local and fast, and the picker says when an answer came
+from further afield.
+
+Place names come back in whatever the locals call them unless a language is
+asked for — `شارع الحبيب بورقيبة` rather than `Avenue Habib Bourguiba`. The
+browser already states what the user reads, so its `Accept-Language` is passed
+through to the geocoder rather than guessed at or made another setting. Only the
+shape RFC 9110 describes is forwarded, since it leaves this server in a request
+to somebody else.
 
 ### Attendee completion and who can be found
 
