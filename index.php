@@ -631,12 +631,17 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * The browser already states the preference, so it is passed on rather
 	 * than guessed at or made another setting.
 	 *
-	 * It leaves this server in a request to a third party, so only the shape
-	 * RFC 9110 5.3.5 describes is forwarded, and only the first 200 bytes of
-	 * it.
+	 * It leaves this server in a request to whichever geocoder is configured,
+	 * which is harmless pointed at your own and one more thing told about your
+	 * users pointed at somebody else's - so it is off until an admin turns it
+	 * on. When on, only the shape RFC 9110 5.3.5 describes is forwarded, and
+	 * only the first 200 bytes of it.
 	 */
 	private function requestLanguages() : string
 	{
+		if (!$this->Config()->Get('plugin', 'geocoder_send_language', false)) {
+			return '';
+		}
 		$sLanguages = \trim(\substr((string) ($_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? ''), 0, 200));
 		return \preg_match('#^[A-Za-z0-9,;=.*\-\x20]+$#', $sLanguages) ? $sLanguages : '';
 	}
@@ -737,8 +742,22 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					. ' https://nominatim.openstreetmap.org. A self-hosted geocoder is usually'
 					. ' a single-country extract, so a meeting abroad finds nothing at all;'
 					. ' this keeps the common case local while still answering the rare one.'
-					. ' Leave empty for no fallback.')
+					. ' Leave empty for no fallback. Off unless filled in: a fallback sends'
+					. ' searches your own geocoder could not answer to somebody else\'s'
+					. ' server, which is a decision for whoever runs this installation.')
 				->SetDefaultValue(''),
+			\RainLoop\Plugins\Property::NewInstance('geocoder_send_language')
+				->SetLabel('Tell the geocoder which language to answer in')
+				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)
+				->SetDescription('Off (default): the geocoder answers in whatever the locals'
+					. ' call a place, so an organiser searching Avenue Habib Bourguiba gets'
+					. ' back شارع الحبيب بورقيبة.'
+					. ' On: the browser\'s Accept-Language is passed through, and places are'
+					. ' named in a language the user reads where OpenStreetMap has one.'
+					. ' It is off by default because that header goes out to whichever'
+					. ' geocoder is configured - harmless pointed at your own, one more'
+					. ' thing told about your users when pointed at somebody else\'s.')
+				->SetDefaultValue(false),
 			\RainLoop\Plugins\Property::NewInstance('auto_sync')
 				->SetLabel('Auto Sync')
 				->SetType(\RainLoop\Enumerations\PluginPropertyType::BOOL)
