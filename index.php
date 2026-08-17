@@ -495,6 +495,86 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 	
 	/**
+	 * Ask the server which resource a UID actually lives at.
+	 *
+	 * Only events this plugin created sit at <UID>.ics. Thunderbird, Evolution
+	 * and Cyrus' own importer name the resource however they like, so guessing
+	 * that path 404s - and a PUT to the guessed path then forks the event into
+	 * a second, stripped-down copy instead of editing the real one. RFC 4791
+	 * 7.8.6 has the server hand us the href instead of us inventing it.
+	 *
+	 * Returns null when the UID is not in the collection, or when the server
+	 * will not answer the query - callers decide what to do with that.
+	 */
+	private function resolveEventHref(array $aConfig, string $sPassword, string $sUid) : ?string
+	{
+		if (!\strlen($sUid)) {
+			return null;
+		}
+
+		$sCollectionUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/'
+			. ($aConfig['Collection'] ?? 'Default') . '/';
+
+		$sBody = '<?xml version="1.0" encoding="utf-8" ?>' . "\n"
+			. '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+			. '<D:prop><D:getetag /></D:prop>'
+			. '<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">'
+			. '<C:prop-filter name="UID">'
+			. '<C:text-match collation="i;octet">'
+			. \htmlspecialchars($sUid, ENT_XML1 | ENT_QUOTES, 'UTF-8')
+			. '</C:text-match></C:prop-filter>'
+			. '</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>';
+
+		$aResult = $this->makeCalDAVRequest($sCollectionUrl, 'REPORT', $aConfig['User'], $sPassword,
+			$sBody, ['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+		if (207 !== (int) $aResult['code']) {
+			return null;
+		}
+
+		try {
+			$oDoc = new \DOMDocument();
+			if (!$oDoc->loadXML((string) $aResult['body'])) {
+				return null;
+			}
+			$oXPath = new \DOMXPath($oDoc);
+			$oXPath->registerNamespace('D', 'DAV:');
+			foreach ($oXPath->query('//D:response/D:href') as $oHref) {
+				$sHref = \trim((string) $oHref->nodeValue);
+				// Some servers echo the collection itself in the multistatus.
+				// That is not the event, and PUTting over it would be a mess.
+				if (\strlen($sHref) && '/' !== \substr($sHref, -1)) {
+					return $this->absoluteDavUrl($aConfig['CalDAVUrl'], $sHref);
+				}
+			}
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'href lookup failed: ' . $oException->getMessage());
+		}
+
+		return null;
+	}
+
+	/**
+	 * A DAV href is usually a path, occasionally a full URL. Either way it has
+	 * to end up absolute against the server we are already talking to. The
+	 * server percent-encodes it for us, so it is passed through untouched.
+	 */
+	private function absoluteDavUrl(string $sBaseUrl, string $sHref) : string
+	{
+		if (\preg_match('#^https?://#i', $sHref)) {
+			return $sHref;
+		}
+
+		$aBase = \parse_url($sBaseUrl);
+		if (empty($aBase['scheme']) || empty($aBase['host'])) {
+			return $sHref;
+		}
+
+		return $aBase['scheme'] . '://' . $aBase['host']
+			. (isset($aBase['port']) ? ':' . $aBase['port'] : '')
+			. '/' . \ltrim($sHref, '/');
+	}
+
+	/**
 	 * Make JMAP request
 	 */
 	private function makeJMAPRequest($url, $username, $password, $data)
@@ -1019,7 +1099,15 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sPassword = (string)$sPassword;
 			}
 			
-			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default') . '/' . $sEventId . '.ics';
+			// Ask the server where the event lives instead of assuming
+			// <UID>.ics, which only holds for events this plugin created.
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId);
+			if (null === $sEventUrl) {
+				// The lookup may simply be unsupported, so still try the name we
+				// would have given it ourselves before giving up.
+				$sEventUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/'
+					. ($aConfig['Collection'] ?? 'Default') . '/' . \rawurlencode($sEventId) . '.ics';
+			}
 
 			// Edit the stored event rather than replacing it. Rebuilding the
 			// object from the handful of fields the dialog knows about silently
@@ -1028,25 +1116,19 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// recurring event in the grid flattened it to a single occurrence.
 			$sICS = null;
 			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
-			if (200 === $aFetch['code'] && \strlen((string) $aFetch['body'])) {
+			if (200 === (int) $aFetch['code'] && \strlen((string) $aFetch['body'])) {
 				$sICS = $this->applyEventEdit(
 					(string) $aFetch['body'], $oAccount, $sTitle, $sStartFormatted,
 					$sEndFormatted, $bAllDay
 				);
 			}
 			if (null === $sICS) {
-				// Not on the server (or unreadable): fall back to a fresh object.
-				$sICS = "BEGIN:VCALENDAR\r\n"
-					. "VERSION:2.0\r\n"
-					. "PRODID:-//Mailbux//CalDAV Plugin//EN\r\n"
-					. "BEGIN:VEVENT\r\n"
-					. "UID:" . $sEventId . "\r\n"
-					. "DTSTAMP:" . gmdate('Ymd\THis\Z') . "\r\n"
-					. "DTSTART" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sStartFormatted . "\r\n"
-					. "DTEND" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sEndFormatted . "\r\n"
-					. "SUMMARY:" . $this->escapeICS($sTitle) . "\r\n"
-					. "END:VEVENT\r\n"
-					. "END:VCALENDAR\r\n";
+				// Nothing readable to edit. Writing a fresh object here is what
+				// used to fork the event into a second, stripped-down copy, so
+				// refuse instead: an edit that cannot find its event has failed,
+				// and the untouched original is still on the server.
+				return $this->jsonResponse(__FUNCTION__, ['success' => false,
+					'error' => 'Could not read this event from the server, so it was left unchanged.']);
 			}
 
 			$result = $this->makeCalDAVRequest(
@@ -1114,8 +1196,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sPassword = (string) $sPassword;
 			}
 
-			$sEventUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
-				. '/' . \rawurlencode($sEventId) . '.ics';
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId)
+				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
+					. '/' . \rawurlencode($sEventId) . '.ics';
 
 			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
 			if (200 !== (int) $aFetch['code'] || !\strlen((string) $aFetch['body'])) {
@@ -1222,11 +1305,15 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sPassword = (string)$sPassword;
 			}
 			
-			// DELETE event from CalDAV server
-			// URL-encode the event ID to handle @ symbols properly
-			$sEventUrl = rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default') . '/' . rawurlencode($sEventId) . '.ics';
-			
-			
+			// DELETE event from CalDAV server, at the resource the server says
+			// holds this UID. <UID>.ics is only where *this* plugin puts them,
+			// so it stays as the fallback for a server that will not answer the
+			// lookup - and the URL-encoding there handles @ in the UID.
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId)
+				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
+					. '/' . \rawurlencode($sEventId) . '.ics';
+
+
 			$result = $this->makeCalDAVRequest(
 				$sEventUrl,
 				'DELETE',
