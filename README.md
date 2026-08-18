@@ -214,6 +214,27 @@ Calendars panel, where one can be made.
   but 40% done is a reading no two clients agree on.
 * **Editing keeps what the dialog never asked about**, the same rule the event
   path follows and for the same reason.
+* **Repeating tasks** use the same named presets as events — daily, weekly,
+  every weekday, bi-weekly, monthly, yearly — and the rule is assembled on the
+  server from those fields, never taken from the browser as a string. A rule
+  needs something to count from, so one on a task with neither a start nor a
+  due date is dropped rather than written as a puzzle. A rule beyond these
+  presets is left exactly as the client that wrote it left it, and the dialog
+  says so instead of the dropdown pretending it says nothing.
+* **Sub-tasks** are `RELATED-TO` with `RELTYPE=PARENT` — the default, so a bare
+  `RELATED-TO` is read as one. Steps appear indented under the task they belong
+  to, wherever that task falls, and the parent shows how many of them are done.
+  `SIBLING` and `CHILD` links another client wrote are left untouched: they are
+  somebody else's structure and this list does not draw them. A task cannot be
+  its own parent, and one whose parent is filtered out of the view stands on
+  its own rather than vanishing with it.
+* **On the grid.** *Show tasks that are due on the grid*, in the Calendars
+  panel, draws every task with a due date where it falls — dotted and italic,
+  struck through once done, so it does not read as an appointment. Dragging one
+  moves when it is due, which is the only thing about a task a grid can
+  express, and clicking it opens it as a task. "What is due on Thursday" is a
+  calendar question, and answering it only in a list means looking in two
+  places to plan one day.
 * Moving a task between lists is not offered: that is a DAV `MOVE` rather than
   a property, and a control that appeared to do it while doing nothing would be
   worse than none.

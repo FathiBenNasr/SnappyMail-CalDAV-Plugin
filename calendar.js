@@ -249,6 +249,11 @@ cal.innerHTML = `
 .task-empty { padding: 24px 16px; color: var(--cal-text-secondary); font-size: 13px; text-align: center; }
 .task-bar { height: 3px; border-radius: 2px; background: var(--cal-border); margin-top: 4px; overflow: hidden; }
 .task-bar span { display: block; height: 100%; background: var(--cal-accent); }
+.task-row.is-child { padding-left: 38px; }
+.task-row.is-child .task-title::before { content: '↳ '; opacity: .5; }
+.task-kids { font-size: 11px; opacity: .7; }
+.modern-event.event-task { border-style: dotted; font-style: italic; }
+.modern-event.event-task-done { opacity: .55; text-decoration: line-through; }
 
 /* Calendars */
 .cal-calendars { background: var(--cal-bg-primary); border-bottom: 1px solid var(--cal-border); padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
@@ -284,6 +289,8 @@ cal.innerHTML = `
 <div class="cal-calendars" id="calendar-panel" style="display:none;">
 	<div class="calendar-list" id="calendar-list"></div>
 	<div class="calendar-new">
+		<label style="width:100%;"><input type="checkbox" id="calendar-show-tasks">
+			<span>Show tasks that are due on the grid</span></label>
 		<input type="text" id="calendar-new-name" placeholder="New calendar" aria-label="New calendar name">
 		<input type="color" id="calendar-new-color" value="#00639a" aria-label="Colour">
 		<label><input type="checkbox" class="calendar-new-comp" value="VEVENT" checked><span>Events</span></label>
@@ -537,6 +544,24 @@ cal.innerHTML = `
 					</div>
 				</div>
 				<div class="event-form-group">
+					<label class="event-form-label" for="task-repeat">Repeats</label>
+					<select class="event-form-select" id="task-repeat">
+						<option value="">Does not repeat</option>
+						<option value="DAILY">Daily</option>
+						<option value="WEEKLY">Weekly</option>
+						<option value="WEEKDAYS">Every weekday</option>
+						<option value="BIWEEKLY">Bi-weekly</option>
+						<option value="MONTHLY">Monthly</option>
+						<option value="YEARLY">Yearly</option>
+					</select>
+					<small class="event-field-hint" id="task-repeat-hint"></small>
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="task-parent">Part of</label>
+					<select class="event-form-select" id="task-parent"></select>
+					<small class="event-field-hint">A task this one is a step towards.</small>
+				</div>
+				<div class="event-form-group">
 					<label class="event-form-label" for="task-categories">Tags</label>
 					<input type="text" class="event-form-input" id="task-categories"
 						placeholder="comma separated">
@@ -723,6 +748,14 @@ cal.innerHTML = `
 		}
 		const calAdd = document.getElementById('calendar-new-add');
 		if (calAdd) calAdd.addEventListener('click', addCalendar);
+		const gridTasks = document.getElementById('calendar-show-tasks');
+		if (gridTasks) {
+			gridTasks.checked = tasksOnGrid();
+			gridTasks.addEventListener('change', () => {
+				setTasksOnGrid(gridTasks.checked);
+				if (calendar) calendar.refetchEvents();
+			});
+		}
 
 		// Tasks: the panel, the quick-add line, and the dialog behind a row.
 		const tasksBtn = document.getElementById('tasks-panel-btn');
@@ -1538,6 +1571,41 @@ function toggleTasks(open) {
 	if (wanted) loadTasks();
 }
 
+const TASKS_ON_GRID_KEY = 'caldav-tasks-on-grid';
+
+function tasksOnGrid() {
+	try { return 'yes' === localStorage.getItem(TASKS_ON_GRID_KEY); }
+	catch (e) { return false; }
+}
+
+function setTasksOnGrid(on) {
+	try { localStorage.setItem(TASKS_ON_GRID_KEY, on ? 'yes' : 'no'); }
+	catch (e) { /* private browsing; the list still has them */ }
+}
+
+// A task with a due date drawn where it falls. It is not an event and should
+// not read as one - dotted, italic, and struck through once it is done - but
+// "what is due on Thursday" is a calendar question, and answering it only in a
+// list means looking in two places to plan one day.
+function taskAsEvent(task) {
+	const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(task.due || '');
+	const due = taskDue(task);
+	if (!due) return null;
+	const done = taskIsDone(task);
+	return {
+		id: 'task:' + task.uid,
+		title: (done ? '✓ ' : '☐ ') + (task.summary || 'Untitled task'),
+		start: dateOnly ? task.due : due,
+		allDay: dateOnly,
+		backgroundColor: task.calendarColor || 'var(--cal-event-bg)',
+		borderColor: task.calendarColor || 'var(--cal-event-border)',
+		textColor: task.calendarColor ? '#fff' : 'var(--cal-event-text)',
+		editable: !task.readOnly,
+		classNames: ['modern-event', 'event-task'].concat(done ? ['event-task-done'] : []),
+		extendedProps: { isTask: true, task: task }
+	};
+}
+
 function loadTasks() {
 	if (!rl.pluginRemoteRequest) return;
 	rl.pluginRemoteRequest((iError, oData) => {
@@ -1637,20 +1705,42 @@ function renderTasks(message) {
 		|| ((a.priority || 10) - (b.priority || 10))
 		|| (a.summary || '').localeCompare(b.summary || ''));
 
+	// A sub-task is shown under the task it is a step towards, in whichever
+	// group the parent lands in - a step is not overdue on its own account
+	// when the thing it belongs to is not due yet.
+	const byUid = {};
+	knownTasks.forEach(t => { byUid[t.uid] = t; });
+	const childrenOf = {};
+	wanted.forEach(t => {
+		if (t.parent && byUid[t.parent]) {
+			(childrenOf[t.parent] = childrenOf[t.parent] || []).push(t);
+		}
+	});
+	const orphaned = (t) => !t.parent || !byUid[t.parent]
+		// A child whose parent is filtered out of the view has to stand on its
+		// own, or it disappears with a parent the reader can still see is done.
+		|| !wanted.some(w => w.uid === t.parent);
+
 	TASK_GROUPS.forEach(group => {
-		const inGroup = wanted.filter(t => taskGroup(t) === group);
+		const inGroup = wanted.filter(t => orphaned(t) && taskGroup(t) === group);
 		if (!inGroup.length) return;
+		const kids = inGroup.reduce((n, t) => n + (childrenOf[t.uid] || []).length, 0);
 		const head = document.createElement('div');
 		head.className = 'task-group';
-		head.textContent = group + ' (' + inGroup.length + ')';
+		head.textContent = group + ' (' + (inGroup.length + kids) + ')';
 		box.appendChild(head);
-		inGroup.forEach(task => box.appendChild(taskRow(task, group)));
+		inGroup.forEach(task => {
+			box.appendChild(taskRow(task, group, childrenOf[task.uid]));
+			(childrenOf[task.uid] || []).forEach(kid =>
+				box.appendChild(taskRow(kid, taskGroup(kid), null, true)));
+		});
 	});
 }
 
-function taskRow(task, group) {
+function taskRow(task, group, children, isChild) {
 	const row = document.createElement('div');
-	row.className = 'task-row' + (taskIsDone(task) ? ' is-done' : '');
+	row.className = 'task-row' + (taskIsDone(task) ? ' is-done' : '')
+		+ (isChild ? ' is-child' : '');
 
 	const tick = document.createElement('input');
 	tick.type = 'checkbox';
@@ -1692,6 +1782,19 @@ function taskRow(task, group) {
 		bang.title = 'High priority';
 		meta.appendChild(bang);
 	}
+	if (task.rrule) {
+		const loop = document.createElement('span');
+		loop.textContent = '↻';
+		loop.title = 'Repeats';
+		meta.appendChild(loop);
+	}
+	if (children && children.length) {
+		const kids = document.createElement('span');
+		kids.className = 'task-kids';
+		const done = children.filter(taskIsDone).length;
+		kids.textContent = done + '/' + children.length + ' steps';
+		meta.appendChild(kids);
+	}
 	(task.categories || []).slice(0, 3).forEach(cat => {
 		const tag = document.createElement('span');
 		tag.textContent = cat;
@@ -1715,6 +1818,9 @@ function taskRow(task, group) {
 }
 
 let editingTask = null;
+// True when the stored rule is beyond what the dropdown can show, so saving
+// deliberately says nothing about recurrence and leaves it alone.
+let taskRepeatUnsupported = false;
 
 function openTaskModal(task) {
 	editingTask = task || null;
@@ -1728,6 +1834,43 @@ function openTaskModal(task) {
 	document.getElementById('task-status').value = task ? (task.status || 'NEEDS-ACTION') : 'NEEDS-ACTION';
 	document.getElementById('task-percent').value = task ? (task.percent || 0) : 0;
 	document.getElementById('task-priority').value = task ? String(task.priority || 0) : '0';
+
+	// How it repeats. Only the named shapes are offered: a rule beyond them was
+	// written by another client and is left exactly as it stands, which the
+	// hint says rather than the dropdown pretending it says nothing.
+	const repeat = document.getElementById('task-repeat');
+	const parsed = parseRRule(task ? (task.rrule || '') : '');
+	const known = task && task.rrule
+		? Object.keys(REPEAT_PRESETS).find(key => {
+			const shape = REPEAT_PRESETS[key];
+			return shape.freq === parsed.freq && shape.interval === parsed.interval
+				&& shape.days.join(',') === parsed.days.join(',');
+		}) : '';
+	taskRepeatUnsupported = !!(task && task.rrule && !known);
+	repeat.value = known || '';
+	repeat.disabled = taskRepeatUnsupported;
+	document.getElementById('task-repeat-hint').textContent = taskRepeatUnsupported
+		? 'This repeats in a way this dialog cannot show, so it is left as it is.'
+		: 'A repeating task needs a date to repeat from.';
+
+	// What it is a step towards. Only tasks on the same list, and never itself
+	// or one of its own steps, which would make a loop nothing can draw.
+	const parent = document.getElementById('task-parent');
+	parent.textContent = '';
+	const none = document.createElement('option');
+	none.value = '';
+	none.textContent = 'Nothing - a task of its own';
+	parent.appendChild(none);
+	const onList = (task && task.calendar) || taskList();
+	knownTasks
+		.filter(t => t.calendar === onList && (!task || (t.uid !== task.uid && t.parent !== task.uid)))
+		.forEach(t => {
+			const option = document.createElement('option');
+			option.value = t.uid;
+			option.textContent = t.summary || 'Untitled task';
+			parent.appendChild(option);
+		});
+	parent.value = (task && task.parent) || '';
 
 	// A date due and a time due are the same field here; which one was stored
 	// is the difference between "Friday" and "Friday at four".
@@ -1785,10 +1928,27 @@ function saveTaskFromModal() {
 		Categories: document.getElementById('task-categories').value,
 		Status: document.getElementById('task-status').value,
 		Percent: parseInt(document.getElementById('task-percent').value, 10) || 0,
-		Priority: parseInt(document.getElementById('task-priority').value, 10) || 0
+		Priority: parseInt(document.getElementById('task-priority').value, 10) || 0,
+		Parent: document.getElementById('task-parent').value,
+		// Omitted when the stored rule is beyond this dialog, so the server
+		// leaves it exactly as the client that wrote it left it.
+		...(taskRepeatUnsupported ? {} : repeatFieldsFor(document.getElementById('task-repeat').value))
 	});
 	document.getElementById('task-modal').classList.remove('show');
 	editingTask = null;
+}
+
+// The named repeat shapes, as the fields the server assembles a rule from.
+function repeatFieldsFor(preset) {
+	const shape = REPEAT_PRESETS[preset];
+	return {
+		Repeat: shape ? shape.freq : '',
+		RepeatInterval: shape ? shape.interval : 1,
+		RepeatDays: shape ? shape.days.join(',') : '',
+		RepeatEnd: '',
+		RepeatCount: 10,
+		RepeatUntil: ''
+	};
 }
 
 function finishTask(task, done) {
@@ -1824,8 +1984,14 @@ function saveTask(fields) {
 		if (iError || !res || !res.success) {
 			alert((res && res.error) || 'Could not save that task.');
 		}
-		loadTasks();
+		refreshTaskViews();
 	}, 'SaveTask', fields);
+}
+
+// Tasks show in two places now, so a change has to reach both.
+function refreshTaskViews() {
+	loadTasks();
+	if (calendar && tasksOnGrid()) calendar.refetchEvents();
 }
 
 function removeTask(task) {
@@ -1836,7 +2002,7 @@ function removeTask(task) {
 		if (iError || !res || !res.success) {
 			alert((res && res.error) || 'Could not delete that task.');
 		}
-		loadTasks();
+		refreshTaskViews();
 	}, 'DeleteTask', { Uid: task.uid, Collection: task.calendar || '' });
 }
 
@@ -2442,6 +2608,12 @@ loadEventsFromCalDAV(successCallback, failureCallback);
 
 eventClick: function(info) {
 	const event = info.event;
+	// A task drawn on the grid opens as a task, not as an event it is not.
+	if (event.extendedProps?.isTask) {
+		toggleTasks(true);
+		openTaskModal(event.extendedProps.task);
+		return;
+	}
 	openEventModal({
 		title: event.title,
 		start: event.start,
@@ -2560,6 +2732,16 @@ return;
 	// changes far too rarely to be worth asking twice.
 	loadCalendars(result.calendars || []);
 
+	// Tasks that are due, if the grid is showing them. They arrive in the same
+	// answer, so there is nothing to wait for before drawing.
+	if (tasksOnGrid()) {
+		knownTasks = result.tasks || [];
+		(result.tasks || []).forEach(task => {
+			const drawn = taskAsEvent(task);
+			if (drawn) events.push(drawn);
+		});
+	}
+
 	// Whether this deployment has a meeting server and a geocoder at all.
 	calFeatures = {
 		conference: !!result.conferenceEnabled,
@@ -2571,7 +2753,7 @@ return;
 	scheduleReminders(result.events || []);
 
 	successCallback(events);
-}, 'GetCalendarEvents', { Collections: shownCalendars().join(',') });
+}, 'GetCalendarEvents', { Collections: shownCalendars().join(','), IncludeTasks: tasksOnGrid() });
 }
 
 /* ------------------------------------------------------------------ *
@@ -2710,6 +2892,18 @@ function formatDateOnly(date) {
 // which - so ask, and put it back where it was if they would rather not say.
 function updateDraggedEvent(info) {
 	const event = info.event;
+	// Dragging a task moves when it is due, which is the only thing about it a
+	// grid can express.
+	if (event.extendedProps?.isTask) {
+		const task = event.extendedProps.task;
+		saveTask({
+			Uid: task.uid,
+			Collection: task.calendar || '',
+			Due: event.allDay ? formatDateOnly(event.start) : event.start.toISOString(),
+			AllDay: !!event.allDay
+		});
+		return;
+	}
 	if (!isRecurring(event)) {
 		updateEvent(event);
 		return;

@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.13',
+		VERSION  = '2.14',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -2114,8 +2114,45 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				}
 			}
 
+			// Tasks with a due date, when the grid is showing them. Same
+			// collections, same round trip: a second request for something the
+			// loop above has already opened would be a request nobody needed.
+			$aDue = array();
+			if ($this->jsonParam('IncludeTasks', false)) {
+				$sTaskQuery = '<?xml version="1.0" encoding="utf-8" ?>'
+					. '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+					. '<D:prop><D:getetag /><C:calendar-data /></D:prop>'
+					. '<C:filter><C:comp-filter name="VCALENDAR">'
+					. '<C:comp-filter name="VTODO" />'
+					. '</C:comp-filter></C:filter></C:calendar-query>';
+				foreach ($aCalendars as $aCalendar) {
+					if (!\in_array('VTODO', $aCalendar['components'], true)) {
+						continue;
+					}
+					$aTaskResult = $this->makeCalDAVRequest($this->collectionUrl($aConfig, $aCalendar['name']),
+						'REPORT', $aConfig['User'], $sPassword, $sTaskQuery,
+						['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+					if (207 !== (int) $aTaskResult['code']) {
+						continue;
+					}
+					foreach ($this->parseTaskResponse((string) $aTaskResult['body']) as $aTask) {
+						// Only the ones with a date: a task with no due date has
+						// nowhere to be drawn, and belongs in the list alone.
+						if (!\strlen($aTask['due'])) {
+							continue;
+						}
+						$aTask['calendar'] = $aCalendar['name'];
+						$aTask['calendarName'] = $aCalendar['displayName'];
+						$aTask['calendarColor'] = $aCalendar['color'];
+						$aTask['readOnly'] = empty($aCalendar['writable']);
+						$aDue[] = $aTask;
+					}
+				}
+			}
+
 			return $this->jsonResponse(__FUNCTION__, [
 				'events' => $aEvents,
+				'tasks' => $aDue,
 				// The picker is filled from the same round trip that fills the
 				// grid: asking twice for something that changes this rarely is
 				// a request nobody needed.
@@ -2850,8 +2887,22 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					}
 				}
 
+				// What this is part of. RFC 5545 3.8.4.5: RELTYPE defaults to
+				// PARENT, so a bare RELATED-TO names the task above this one.
+				// SIBLING and CHILD links are left alone - they are somebody
+				// else's structure and this list does not show them.
+				$sParent = '';
+				foreach ($oTodo->select('RELATED-TO') as $oRelated) {
+					$sType = \strtoupper(\trim((string) ($oRelated['RELTYPE'] ?? 'PARENT')));
+					if ('PARENT' === $sType) {
+						$sParent = \trim((string) $oRelated);
+						break;
+					}
+				}
+
 				$aTasks[] = array(
 					'uid'         => (string) ($oTodo->UID ?? ''),
+					'parent'      => $sParent,
 					'summary'     => (string) ($oTodo->SUMMARY ?? 'Untitled task'),
 					'description' => (string) ($oTodo->DESCRIPTION ?? ''),
 					'due'         => $oDue ? $oDue->getDateTime()->format($sFmt) : '',
@@ -3043,6 +3094,41 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$oTodo->remove('CATEGORIES');
 				if ($aWanted) {
 					$oTodo->add('CATEGORIES', \array_slice($aWanted, 0, 20));
+				}
+			}
+
+			// How it repeats, on the same terms as an event: assembled here from
+			// named fields, never taken as a rule from the browser. A repeating
+			// task needs something to repeat from, and DUE is that when there
+			// is no DTSTART - a rule on a task with neither has nothing to
+			// count from and is dropped rather than written as a puzzle.
+			$mRepeat = $this->jsonParam('Repeat', null);
+			if (null !== $mRepeat) {
+				$sRRule = $this->buildRecurrenceRule($bAllDay);
+				$oTodo->remove('RRULE');
+				if (\strlen($sRRule) && (isset($oTodo->DTSTART) || isset($oTodo->DUE))) {
+					$oTodo->add('RRULE', $sRRule);
+				}
+			}
+
+			// What it is part of. A task cannot be its own parent, and a UID
+			// that names nothing is a dangling link, so only a plain identifier
+			// is accepted and an empty one clears the link.
+			$mParent = $this->jsonParam('Parent', null);
+			if (null !== $mParent) {
+				$sParent = \trim((string) $mParent);
+				$aKeep = array();
+				foreach ($oTodo->select('RELATED-TO') as $oRelated) {
+					if ('PARENT' !== \strtoupper(\trim((string) ($oRelated['RELTYPE'] ?? 'PARENT')))) {
+						$aKeep[] = array((string) $oRelated, (string) ($oRelated['RELTYPE'] ?? ''));
+					}
+				}
+				$oTodo->remove('RELATED-TO');
+				foreach ($aKeep as $aOther) {
+					$oTodo->add('RELATED-TO', $aOther[0], array('RELTYPE' => $aOther[1]));
+				}
+				if (\strlen($sParent) && 0 !== \strcasecmp($sParent, $sUid) && 512 > \strlen($sParent)) {
+					$oTodo->add('RELATED-TO', $sParent, array('RELTYPE' => 'PARENT'));
 				}
 			}
 
