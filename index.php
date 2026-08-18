@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.12',
+		VERSION  = '2.13',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -25,6 +25,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('RespondCalendarEvent', 'DoRespondCalendarEvent');
 		$this->addJsonHook('ListCalendars', 'DoListCalendars');
 		$this->addJsonHook('CreateCalendar', 'DoCreateCalendar');
+		$this->addJsonHook('UpdateCalendar', 'DoUpdateCalendar');
+		$this->addJsonHook('GetTasks', 'DoGetTasks');
+		$this->addJsonHook('SaveTask', 'DoSaveTask');
+		$this->addJsonHook('DeleteTask', 'DoDeleteTask');
 		$this->addJsonHook('DeleteCalendar', 'DoDeleteCalendar');
 		$this->addJsonHook('SuggestAttendees', 'DoSuggestAttendees');
 		$this->addJsonHook('NewConferenceUrl', 'DoNewConferenceUrl');
@@ -2664,6 +2668,81 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 
 	/**
+	 * Rename or recolour a calendar. Which components it holds is not among
+	 * the properties: most servers fix that at creation, and a PROPPATCH that
+	 * silently did nothing would be worse than not offering it.
+	 */
+	public function DoUpdateCalendar() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+			$sName = \trim((string) $this->jsonParam('Name', ''));
+			if (!\strlen($sName)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Which calendar?']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+
+			$sSet = '';
+			$mColour = $this->jsonParam('Color', null);
+			if (null !== $mColour) {
+				$sColour = \trim((string) $mColour);
+				if (!\preg_match('/^#[0-9A-Fa-f]{6}$/', $sColour)) {
+					return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'That is not a colour']);
+				}
+				$sSet .= '<IC:calendar-color>' . $sColour . '</IC:calendar-color>';
+			}
+			$mTitle = $this->jsonParam('DisplayName', null);
+			if (null !== $mTitle) {
+				$sTitle = \mb_substr(\trim((string) $mTitle), 0, 100);
+				if (!\strlen($sTitle)) {
+					return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'A name is required']);
+				}
+				$sSet .= '<D:displayname>' . \htmlspecialchars($sTitle, ENT_XML1 | ENT_QUOTES, 'UTF-8') . '</D:displayname>';
+			}
+			if (!\strlen($sSet)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Nothing to change']);
+			}
+
+			$sXml = '<?xml version="1.0" encoding="utf-8" ?>'
+				. '<D:propertyupdate xmlns:D="DAV:" xmlns:IC="http://apple.com/ns/ical/">'
+				. '<D:set><D:prop>' . $sSet . '</D:prop></D:set></D:propertyupdate>';
+
+			$aResult = $this->makeCalDAVRequest($this->collectionUrl($aConfig, $sName), 'PROPPATCH',
+				$aConfig['User'], $sPassword, $sXml,
+				['Content-Type: application/xml; charset=utf-8']);
+
+			// A PROPPATCH answers 207 whether or not it did anything, so the
+			// per-property status is what actually says it worked.
+			$bOk = \in_array((int) $aResult['code'], array(200, 204), true);
+			if (207 === (int) $aResult['code']) {
+				$oDoc = $this->loadDavXml((string) $aResult['body']);
+				$bOk = true;
+				if ($oDoc) {
+					$oXPath = new \DOMXPath($oDoc);
+					$oXPath->registerNamespace('D', 'DAV:');
+					foreach ($oXPath->query('//D:propstat/D:status') as $oStatus) {
+						if (!\preg_match('# 2\d\d #', ' ' . \trim((string) $oStatus->nodeValue) . ' ')) {
+							$bOk = false;
+						}
+					}
+				}
+			}
+			return $this->jsonResponse(__FUNCTION__, $bOk
+				? ['success' => true]
+				: ['success' => false, 'error' => 'The server would not change it (' . $aResult['code'] . ')']);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
 	 * Remove a calendar, with everything in it. The configured one is refused:
 	 * it is where this plugin writes by default, and deleting it would leave
 	 * the account pointing at a collection that is not there.
@@ -2722,6 +2801,419 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$mPassword = (string) $mPassword;
 		}
 		return \is_string($mPassword) ? $mPassword : null;
+	}
+
+	/* --------------------------------------------------------------- *
+	 * Tasks
+	 *
+	 * A VTODO lives in the same collections, under the same account, as a
+	 * VEVENT - which is why this is not a plugin of its own. It is not the
+	 * same shape though: a task is a due date, a state and a proportion
+	 * done, not a span in a grid, so it gets its own reading and writing
+	 * rather than being squeezed through the event path.
+	 * --------------------------------------------------------------- */
+
+	/**
+	 * The VTODOs in one iCalendar object.
+	 */
+	private function parseTaskICS(string $sIcs) : array
+	{
+		$aTasks = array();
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sIcs, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VTODO)) {
+				return $aTasks;
+			}
+			foreach ($oVCal->VTODO as $oTodo) {
+				$oDue = $oTodo->DUE ?? null;
+				$oStart = $oTodo->DTSTART ?? null;
+				// A task due on a date is due all that day; one due at a time
+				// is due then. The value type says which, and the grid and the
+				// list both need to know before they can say "overdue".
+				$bAllDay = $oDue ? !$oDue->hasTime() : ($oStart ? !$oStart->hasTime() : true);
+				$sFmt = $bAllDay ? 'Y-m-d' : 'c';
+
+				$iPercent = (int) ((string) ($oTodo->{'PERCENT-COMPLETE'} ?? '0'));
+				$sStatus = \strtoupper(\trim((string) ($oTodo->STATUS ?? '')));
+				if (!\strlen($sStatus)) {
+					$sStatus = (100 <= $iPercent || isset($oTodo->COMPLETED))
+						? 'COMPLETED' : 'NEEDS-ACTION';
+				}
+
+				$aCategories = array();
+				foreach ($oTodo->select('CATEGORIES') as $oCategory) {
+					foreach ($oCategory->getParts() as $sPart) {
+						$sPart = \trim((string) $sPart);
+						if (\strlen($sPart)) {
+							$aCategories[] = $sPart;
+						}
+					}
+				}
+
+				$aTasks[] = array(
+					'uid'         => (string) ($oTodo->UID ?? ''),
+					'summary'     => (string) ($oTodo->SUMMARY ?? 'Untitled task'),
+					'description' => (string) ($oTodo->DESCRIPTION ?? ''),
+					'due'         => $oDue ? $oDue->getDateTime()->format($sFmt) : '',
+					'start'       => $oStart ? $oStart->getDateTime()->format($sFmt) : '',
+					'completed'   => isset($oTodo->COMPLETED)
+						? $oTodo->COMPLETED->getDateTime()->format('c') : '',
+					'status'      => $sStatus,
+					'percent'     => \max(0, \min(100, $iPercent)),
+					'priority'    => \max(0, \min(9, (int) ((string) ($oTodo->PRIORITY ?? '0')))),
+					'categories'  => $aCategories,
+					'allDay'      => $bAllDay,
+					'rrule'       => (string) ($oTodo->RRULE ?? '')
+				);
+			}
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'task parse failed: ' . $oException->getMessage());
+		}
+		return $aTasks;
+	}
+
+	/**
+	 * The tasks in a REPORT multistatus.
+	 */
+	private function parseTaskResponse(string $sXml) : array
+	{
+		$aTasks = array();
+		$oDoc = $this->loadDavXml($sXml);
+		if (!$oDoc) {
+			return $aTasks;
+		}
+		$oXPath = new \DOMXPath($oDoc);
+		$oXPath->registerNamespace('D', 'DAV:');
+		$oXPath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');
+		foreach ($oXPath->query('//C:calendar-data') as $oData) {
+			foreach ($this->parseTaskICS((string) $oData->nodeValue) as $aTask) {
+				if (\strlen($aTask['uid'])) {
+					$aTasks[] = $aTask;
+				}
+			}
+		}
+		return $aTasks;
+	}
+
+	/**
+	 * Everything on the account's task lists.
+	 */
+	public function DoGetTasks() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'tasks' => [],
+					'lists' => [], 'error' => 'Calendar not configured']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'tasks' => [],
+					'lists' => [], 'error' => 'Cannot access encryption key']);
+			}
+
+			// Only the collections that say they hold tasks. Asking one that
+			// does not is not an error, just an empty answer and a round trip
+			// nobody needed.
+			$aLists = array();
+			foreach ($this->listCalendars($aConfig, $sPassword) as $aCalendar) {
+				if (\in_array('VTODO', $aCalendar['components'], true)) {
+					$aLists[] = $aCalendar;
+				}
+			}
+
+			$sBody = '<?xml version="1.0" encoding="utf-8" ?>'
+				. '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+				. '<D:prop><D:getetag /><C:calendar-data /></D:prop>'
+				. '<C:filter><C:comp-filter name="VCALENDAR">'
+				. '<C:comp-filter name="VTODO" />'
+				. '</C:comp-filter></C:filter></C:calendar-query>';
+
+			$aTasks = array();
+			foreach ($aLists as $aCalendar) {
+				$aResult = $this->makeCalDAVRequest($this->collectionUrl($aConfig, $aCalendar['name']),
+					'REPORT', $aConfig['User'], $sPassword, $sBody,
+					['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+				if (207 !== (int) $aResult['code']) {
+					continue;
+				}
+				foreach ($this->parseTaskResponse((string) $aResult['body']) as $aTask) {
+					$aTask['calendar'] = $aCalendar['name'];
+					$aTask['calendarName'] = $aCalendar['displayName'];
+					$aTask['calendarColor'] = $aCalendar['color'];
+					$aTask['readOnly'] = empty($aCalendar['writable']);
+					$aTasks[] = $aTask;
+				}
+			}
+
+			return $this->jsonResponse(__FUNCTION__, ['success' => true,
+				'tasks' => $aTasks, 'lists' => $aLists]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'tasks' => [],
+				'lists' => [], 'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
+	 * Write the dialog's fields on to a VTODO, leaving everything else it
+	 * carries alone - the same rule the event path follows, and for the same
+	 * reason: another client wrote things here this one has never heard of.
+	 *
+	 * $sExisting empty means a new task.
+	 */
+	private function applyTaskEdit(string $sExisting, string $sUid) : ?string
+	{
+		try {
+			$oVCal = null;
+			$oTodo = null;
+			if (\strlen($sExisting)) {
+				$oVCal = \Sabre\VObject\Reader::read($sExisting, \Sabre\VObject\Reader::OPTION_FORGIVING);
+				if (($oVCal instanceof \Sabre\VObject\Component\VCalendar) && isset($oVCal->VTODO)) {
+					$oTodo = $oVCal->VTODO;
+				} else {
+					return null;
+				}
+			} else {
+				$oVCal = new \Sabre\VObject\Component\VCalendar();
+				$oTodo = $oVCal->add('VTODO', array('UID' => $sUid));
+			}
+
+			$mTitle = $this->jsonParam('Title', null);
+			if (null !== $mTitle) {
+				$sTitle = \trim((string) $mTitle);
+				if (!\strlen($sTitle)) {
+					return null;
+				}
+				$oTodo->SUMMARY = \mb_substr($sTitle, 0, 500);
+			}
+
+			$bAllDay = (bool) $this->jsonParam('AllDay', true);
+			foreach (array('Due' => 'DUE', 'Start' => 'DTSTART') as $sField => $sProperty) {
+				$mValue = $this->jsonParam($sField, null);
+				if (null === $mValue) {
+					continue;
+				}
+				$sValue = \trim((string) $mValue);
+				$oTodo->remove($sProperty);
+				if (!\strlen($sValue)) {
+					continue;
+				}
+				// A date is a date and a time is a time; writing a DATE-TIME
+				// where the user gave a day would make a task due at midnight,
+				// which is not what "Friday" means.
+				if (\preg_match('/^\d{4}-\d{2}-\d{2}$/', $sValue)) {
+					$oTodo->add($sProperty, \str_replace('-', '', $sValue), array('VALUE' => 'DATE'));
+				} else {
+					try {
+						$oWhen = new \DateTime($sValue, new \DateTimeZone('UTC'));
+					} catch (\Throwable $oException) {
+						continue;
+					}
+					$oTodo->add($sProperty, $oWhen->format('Ymd\THis\Z'));
+				}
+			}
+
+			$mDescription = $this->jsonParam('Description', null);
+			if (null !== $mDescription) {
+				$oTodo->remove('DESCRIPTION');
+				if (\strlen(\trim((string) $mDescription))) {
+					$oTodo->add('DESCRIPTION', (string) $mDescription);
+				}
+			}
+
+			$mPriority = $this->jsonParam('Priority', null);
+			if (null !== $mPriority) {
+				$iPriority = \max(0, \min(9, (int) $mPriority));
+				$oTodo->remove('PRIORITY');
+				if ($iPriority) {
+					$oTodo->add('PRIORITY', (string) $iPriority);
+				}
+			}
+
+			$mCategories = $this->jsonParam('Categories', null);
+			if (null !== $mCategories) {
+				$aWanted = array();
+				foreach (\preg_split('/[,;]+/', (string) $mCategories, -1, PREG_SPLIT_NO_EMPTY) as $sOne) {
+					$sOne = \trim($sOne);
+					if (\strlen($sOne)) {
+						$aWanted[] = \mb_substr($sOne, 0, 60);
+					}
+				}
+				$oTodo->remove('CATEGORIES');
+				if ($aWanted) {
+					$oTodo->add('CATEGORIES', \array_slice($aWanted, 0, 20));
+				}
+			}
+
+			// State, and how far along. The two are kept consistent with each
+			// other and with COMPLETED, because a task that is done but 40%
+			// finished is a reading no client agrees on.
+			$mStatus = $this->jsonParam('Status', null);
+			$mPercent = $this->jsonParam('Percent', null);
+			if (null !== $mStatus || null !== $mPercent) {
+				$sStatus = \strtoupper(\trim((string) ($mStatus ?? (string) ($oTodo->STATUS ?? 'NEEDS-ACTION'))));
+				if (!\in_array($sStatus, array('NEEDS-ACTION', 'IN-PROCESS', 'COMPLETED', 'CANCELLED'), true)) {
+					$sStatus = 'NEEDS-ACTION';
+				}
+				$iPercent = (null !== $mPercent)
+					? \max(0, \min(100, (int) $mPercent))
+					: (int) ((string) ($oTodo->{'PERCENT-COMPLETE'} ?? '0'));
+
+				if ('COMPLETED' === $sStatus) {
+					$iPercent = 100;
+				} elseif (100 <= $iPercent) {
+					// Finished is finished, whichever end it was said from.
+					$sStatus = 'COMPLETED';
+				} elseif ('NEEDS-ACTION' === $sStatus && 0 < $iPercent) {
+					$sStatus = 'IN-PROCESS';
+				}
+
+				$oTodo->STATUS = $sStatus;
+				$oTodo->remove('PERCENT-COMPLETE');
+				if ($iPercent) {
+					$oTodo->add('PERCENT-COMPLETE', (string) $iPercent);
+				}
+				$oTodo->remove('COMPLETED');
+				if ('COMPLETED' === $sStatus) {
+					$oTodo->add('COMPLETED',
+						(new \DateTime('now', new \DateTimeZone('UTC')))->format('Ymd\THis\Z'));
+				}
+			}
+
+			$oTodo->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+			if (!isset($oTodo->CREATED) && !\strlen($sExisting)) {
+				$oTodo->add('CREATED', (new \DateTime('now', new \DateTimeZone('UTC')))->format('Ymd\THis\Z'));
+			}
+			$oTodo->{'LAST-MODIFIED'} = new \DateTime('now', new \DateTimeZone('UTC'));
+
+			return $oVCal->serialize();
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'task write failed: ' . $oException->getMessage());
+			return null;
+		}
+	}
+
+	/**
+	 * Create or change a task.
+	 */
+	public function DoSaveTask() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+
+			$sCollection = (string) $this->jsonParam('Collection', '');
+			$sUid = \trim((string) $this->jsonParam('Uid', ''));
+			$sExisting = '';
+			$sUrl = '';
+
+			if (\strlen($sUid)) {
+				$sUrl = $this->resolveTaskHref($aConfig, $sPassword, $sUid, $sCollection)
+					?: $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sUid) . '.ics';
+				$aFetch = $this->makeCalDAVRequest($sUrl, 'GET', $aConfig['User'], $sPassword);
+				if (200 !== (int) $aFetch['code'] || !\strlen((string) $aFetch['body'])) {
+					return $this->jsonResponse(__FUNCTION__, ['success' => false,
+						'error' => 'Could not read this task from the server, so it was left unchanged.']);
+				}
+				$sExisting = (string) $aFetch['body'];
+			} else {
+				$sUid = \uniqid('task-') . '@' . $aConfig['User'];
+				$sUrl = $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sUid) . '.ics';
+			}
+
+			$sICS = $this->applyTaskEdit($sExisting, $sUid);
+			if (null === $sICS) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false,
+					'error' => 'That task could not be written. A title is required.']);
+			}
+
+			$aResult = $this->makeCalDAVRequest($sUrl, 'PUT', $aConfig['User'], $sPassword,
+				$sICS, ['Content-Type: text/calendar; charset=utf-8']);
+			return $this->jsonResponse(__FUNCTION__,
+				\in_array((int) $aResult['code'], array(200, 201, 204), true)
+					? ['success' => true, 'uid' => $sUid]
+					: ['success' => false, 'error' => 'CalDAV error: ' . $aResult['code']]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
+	public function DoDeleteTask() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+			$sUid = \trim((string) $this->jsonParam('Uid', ''));
+			if (!\strlen($sUid)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Which task?']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+			$sCollection = (string) $this->jsonParam('Collection', '');
+			$sUrl = $this->resolveTaskHref($aConfig, $sPassword, $sUid, $sCollection)
+				?: $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sUid) . '.ics';
+
+			$aResult = $this->makeCalDAVRequest($sUrl, 'DELETE', $aConfig['User'], $sPassword);
+			return $this->jsonResponse(__FUNCTION__,
+				\in_array((int) $aResult['code'], array(200, 202, 204), true)
+					? ['success' => true]
+					: ['success' => false, 'error' => 'CalDAV error: ' . $aResult['code']]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
+	 * Where a task lives, asked of the server rather than assumed - the same
+	 * reason events do it: only the ones this plugin wrote sit at <UID>.ics.
+	 */
+	private function resolveTaskHref(array $aConfig, string $sPassword, string $sUid,
+		string $sCollection = '') : ?string
+	{
+		if (!\strlen($sUid)) {
+			return null;
+		}
+		$sBody = '<?xml version="1.0" encoding="utf-8" ?>'
+			. '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+			. '<D:prop><D:getetag /></D:prop>'
+			. '<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VTODO">'
+			. '<C:prop-filter name="UID"><C:text-match collation="i;octet">'
+			. \htmlspecialchars($sUid, ENT_XML1 | ENT_QUOTES, 'UTF-8')
+			. '</C:text-match></C:prop-filter>'
+			. '</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>';
+
+		$aResult = $this->makeCalDAVRequest($this->collectionUrl($aConfig, $sCollection), 'REPORT',
+			$aConfig['User'], $sPassword, $sBody,
+			['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+		if (207 !== (int) $aResult['code']) {
+			return null;
+		}
+		$oDoc = $this->loadDavXml((string) $aResult['body']);
+		if (!$oDoc) {
+			return null;
+		}
+		$oXPath = new \DOMXPath($oDoc);
+		$oXPath->registerNamespace('D', 'DAV:');
+		foreach ($oXPath->query('//D:response/D:href') as $oHref) {
+			$sHref = \trim((string) $oHref->nodeValue);
+			if (\strlen($sHref) && '/' !== \substr($sHref, -1)) {
+				return $this->absoluteDavUrl($aConfig['CalDAVUrl'], $sHref);
+			}
+		}
+		return null;
 	}
 
 	/**

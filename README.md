@@ -156,6 +156,12 @@ each event came out of, and makes new ones.
 * **Showing and hiding** is kept in the browser, not on the server: it is a view
   preference rather than a property of the calendar, and the same account read
   from a phone may reasonably want a different answer.
+* **Renaming and recolouring** an existing one is a `PROPPATCH`: the swatch on
+  each row is the colour control, and double-clicking the name renames it. A
+  `PROPPATCH` answers `207` whether or not it changed anything, so the
+  per-property status is read rather than the response code assumed. What a
+  calendar may *hold* is not offered — most servers fix that at creation, and a
+  control that silently did nothing would be worse than no control.
 * **Making one** issues `MKCALENDAR` with a display name, a colour, and the
   components it may hold — events, tasks or notes (`VEVENT`, `VTODO`,
   `VJOURNAL`). Most servers fix that set at creation, which is why it is asked
@@ -179,6 +185,38 @@ different one.
 
 The scheduling Inbox and Outbox carry the `calendar` resourcetype too, and are
 deliberately left out: drawing them would show every invitation twice.
+
+## Tasks
+
+A `VTODO` lives in the same collections, under the same account, as an event —
+which is why this is not a plugin of its own. It is not the same shape though:
+a task is a due date, a state and a proportion done, not a span in a grid. So
+it gets a list rather than a place on the calendar, reached by the **✓** button
+in the folder toolbar or the **✓ Tasks** button on the calendar screen.
+
+Tasks are read from every collection whose `supported-calendar-component-set`
+says it holds them — asking one that does not is a round trip for an empty
+answer. If no calendar holds tasks yet, the list says so and points at the
+Calendars panel, where one can be made.
+
+* **Grouped by when they are due** — overdue, today, this week, later, no date,
+  then dropped and done. Within a group they sort by due date and then by
+  priority. A task with no priority sorts *after* one with any, because 0 in
+  [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) means undefined, not
+  lowest.
+* **A task due on a date is due at the end of that day.** "Friday" is not
+  overdue on Friday morning, which is what comparing against the start of the
+  day would have said.
+* **State and proportion are kept agreeing.** Ticking one off writes
+  `STATUS:COMPLETED`, `PERCENT-COMPLETE:100` and a `COMPLETED` timestamp;
+  setting it back to not-started clears all three; typing 100% marks it done,
+  and any progress at all moves it out of not-started. A task that is finished
+  but 40% done is a reading no two clients agree on.
+* **Editing keeps what the dialog never asked about**, the same rule the event
+  path follows and for the same reason.
+* Moving a task between lists is not offered: that is a DAV `MOVE` rather than
+  a property, and a control that appeared to do it while doing nothing would be
+  worse than none.
 
 ## Repeating events
 

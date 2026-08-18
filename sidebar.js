@@ -40,13 +40,23 @@ addEventListener('rl-view-model.create', e => {
 			window.location.hash = '#/calendar';
 		};
 
+		// Tasks are the same account and the same collections, so they are the
+		// same plugin - but they are a list, not a grid, and asking "what do I
+		// have to do" is not asking "what is my week". They get their own way
+		// in rather than a panel to go and find.
+		view.tasksClick = () => { window.location.hash = '#/calendar/tasks'; };
+
 		const contacts = toolbar.querySelector('.buttonContacts');
 		const link = Element.fromHTML(
 			'<a class="btn buttonCalendar fontastic" title="Calendar"'
 			+ ' data-bind="click: calendarClick">📅</a>');
+		const tasks = Element.fromHTML(
+			'<a class="btn buttonTasks fontastic" title="Tasks"'
+			+ ' data-bind="click: tasksClick">✓</a>');
 
 		// Sit next to Contacts when it is there, otherwise at the end.
 		contacts ? contacts.after(link) : toolbar.append(link);
+		link.after(tasks);
 	} catch (err) {
 		console.error('[caldav sidebar]', err);
 	}

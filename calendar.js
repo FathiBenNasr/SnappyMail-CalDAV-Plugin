@@ -15,6 +15,14 @@ if (window.rl && rl.route) {
 window.addEventListener('hashchange', () => {
 	if (window.location.hash.includes('calendar')) {
 		setTimeout(showCalendar, 100);
+		// #/calendar/tasks is the same screen with the task list open. The
+		// panel has to be opened on every arrival, not only the first, or the
+		// toolbar's ✓ does nothing once the calendar is already showing.
+		setTimeout(() => {
+			if ('function' === typeof toggleTasks) {
+				toggleTasks(window.location.hash.includes('task'));
+			}
+		}, 200);
 	} else {
 		hideCalendar();
 	}
@@ -220,11 +228,36 @@ cal.innerHTML = `
 .place-result:hover, .place-result.is-active { background: var(--cal-bg-tertiary); }
 .place-status { margin-top: 12px; font-size: 13px; opacity: .75; }
 
+/* Tasks */
+.cal-tasks { position: absolute; top: 0; right: 0; bottom: 0; width: 380px; max-width: 100%; background: var(--cal-bg-primary); border-left: 1px solid var(--cal-border); box-shadow: -2px 0 12px var(--cal-shadow); display: flex; flex-direction: column; z-index: 5; }
+.cal-tasks-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--cal-border); }
+.cal-tasks-head h2 { margin: 0; font-size: 16px; flex: 1; }
+.cal-tasks-body { flex: 1; overflow-y: auto; padding: 8px 0 20px; }
+.cal-tasks-new { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--cal-border); }
+.cal-tasks-new input { flex: 1; padding: 8px 10px; border: 1px solid var(--cal-border); border-radius: 6px; background: var(--cal-bg-primary); color: var(--cal-text-primary); }
+.task-group { padding: 12px 16px 2px; font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--cal-text-tertiary); }
+.task-row { display: flex; gap: 10px; align-items: flex-start; padding: 7px 16px; cursor: pointer; }
+.task-row:hover { background: var(--cal-bg-tertiary); }
+.task-row input[type="checkbox"] { margin-top: 3px; flex: none; }
+.task-main { flex: 1; min-width: 0; }
+.task-title { font-size: 14px; overflow: hidden; text-overflow: ellipsis; }
+.task-row.is-done .task-title { text-decoration: line-through; opacity: .55; }
+.task-meta { font-size: 11px; color: var(--cal-text-secondary); margin-top: 2px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.task-late { color: var(--cal-danger); font-weight: 600; }
+.task-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.task-bang { color: var(--cal-danger); font-weight: 700; }
+.task-empty { padding: 24px 16px; color: var(--cal-text-secondary); font-size: 13px; text-align: center; }
+.task-bar { height: 3px; border-radius: 2px; background: var(--cal-border); margin-top: 4px; overflow: hidden; }
+.task-bar span { display: block; height: 100%; background: var(--cal-accent); }
+
 /* Calendars */
 .cal-calendars { background: var(--cal-bg-primary); border-bottom: 1px solid var(--cal-border); padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
 .calendar-list { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
 .calendar-row { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
-.calendar-swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; border: 1px solid var(--cal-border); }
+.calendar-swatch { width: 20px; height: 20px; border-radius: 4px; flex: none; padding: 0; border: 1px solid var(--cal-border); background: none; cursor: pointer; }
+.calendar-swatch:disabled { cursor: default; opacity: .6; }
+.calendar-swatch::-webkit-color-swatch-wrapper { padding: 2px; }
+.calendar-swatch::-webkit-color-swatch { border: none; border-radius: 2px; }
 .calendar-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .calendar-drop { border: 0; background: none; color: inherit; cursor: pointer; opacity: .5; font-size: 15px; line-height: 1; padding: 0 4px; }
 .calendar-drop:hover { opacity: 1; color: var(--cal-danger); }
@@ -244,6 +277,7 @@ cal.innerHTML = `
 <button class="cal-add-btn" id="new-event-btn"><span style="font-size:20px">+</span> Add</button>
 <button class="cal-add-btn" id="calendar-panel-btn" title="Show, hide and make calendars"
 	aria-expanded="false">📚 Calendars</button>
+<button class="cal-add-btn" id="tasks-panel-btn" title="Tasks" aria-expanded="false">✓ Tasks</button>
 </div>
 <div class="cal-header-right" id="cal-account-switcher"></div>
 </div>
@@ -260,6 +294,21 @@ cal.innerHTML = `
 </div>
 <div class="cal-content">
 			<div id="fc-calendar"></div>
+			<div class="cal-tasks" id="tasks-panel" style="display:none;">
+				<div class="cal-tasks-head">
+					<h2>Tasks</h2>
+					<label style="font-size:12px;display:flex;gap:5px;align-items:center;">
+						<input type="checkbox" id="tasks-show-done"><span>Show done</span>
+					</label>
+					<button type="button" class="event-modal-btn event-modal-btn-secondary"
+						id="tasks-close" aria-label="Close tasks">×</button>
+				</div>
+				<div class="cal-tasks-body" id="tasks-list"></div>
+				<div class="cal-tasks-new">
+					<input type="text" id="task-quick" placeholder="Add a task and press Enter"
+						aria-label="New task">
+				</div>
+			</div>
 		</div>
 	</div>
 </div>
@@ -432,6 +481,80 @@ cal.innerHTML = `
 	</div>
 </div>
 
+<div class="event-modal-overlay" id="task-modal">
+	<div class="event-modal event-modal-narrow">
+		<div class="event-modal-header">
+			<h2 class="event-modal-title" id="task-modal-title">Task</h2>
+			<button class="event-modal-close" id="task-modal-close">×</button>
+		</div>
+		<div class="event-modal-body">
+			<form id="task-form">
+				<div class="event-form-group">
+					<label class="event-form-label" for="task-title">Task *</label>
+					<input type="text" class="event-form-input" id="task-title" required
+						placeholder="What has to be done">
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="task-due">Due</label>
+					<div class="event-repeat-row">
+						<input type="date" class="event-form-input event-repeat-until" id="task-due"
+							aria-label="Due date">
+						<input type="time" class="event-form-input event-repeat-num" id="task-due-time"
+							aria-label="Due time" style="width:110px;">
+						<button type="button" class="event-modal-btn event-modal-btn-secondary"
+							id="task-due-clear">Clear</button>
+					</div>
+					<small class="event-field-hint">Leave the time empty for a task due any time that day.</small>
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="task-list">List</label>
+					<select class="event-form-select" id="task-list"></select>
+				</div>
+				<div class="event-form-group">
+					<div class="event-repeat-row">
+						<label class="event-form-label" for="task-status" style="margin:0;">State</label>
+						<select class="event-form-select" id="task-status" style="width:auto;">
+							<option value="NEEDS-ACTION">Not started</option>
+							<option value="IN-PROCESS">In progress</option>
+							<option value="COMPLETED">Done</option>
+							<option value="CANCELLED">Dropped</option>
+						</select>
+						<label for="task-percent">Done</label>
+						<input type="number" class="event-form-input event-repeat-num" id="task-percent"
+							min="0" max="100" step="5" value="0" aria-label="Per cent done">
+						<span>%</span>
+					</div>
+				</div>
+				<div class="event-form-group">
+					<div class="event-repeat-row">
+						<label class="event-form-label" for="task-priority" style="margin:0;">Priority</label>
+						<select class="event-form-select" id="task-priority" style="width:auto;">
+							<option value="0">None</option>
+							<option value="1">High</option>
+							<option value="5">Normal</option>
+							<option value="9">Low</option>
+						</select>
+					</div>
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="task-categories">Tags</label>
+					<input type="text" class="event-form-input" id="task-categories"
+						placeholder="comma separated">
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="task-description">Notes</label>
+					<textarea class="event-form-textarea" id="task-description"></textarea>
+				</div>
+			</form>
+		</div>
+		<div class="event-modal-footer">
+			<button class="event-modal-btn event-modal-btn-danger" id="task-delete-btn" style="display:none;">Delete</button>
+			<button class="event-modal-btn event-modal-btn-secondary" id="task-cancel-btn">Cancel</button>
+			<button class="event-modal-btn event-modal-btn-primary" id="task-save-btn">Save</button>
+		</div>
+	</div>
+</div>
+
 <div class="event-modal-overlay" id="scope-modal">
 	<div class="event-modal event-modal-narrow">
 		<div class="event-modal-header">
@@ -600,6 +723,60 @@ cal.innerHTML = `
 		}
 		const calAdd = document.getElementById('calendar-new-add');
 		if (calAdd) calAdd.addEventListener('click', addCalendar);
+
+		// Tasks: the panel, the quick-add line, and the dialog behind a row.
+		const tasksBtn = document.getElementById('tasks-panel-btn');
+		if (tasksBtn) tasksBtn.addEventListener('click', () => toggleTasks());
+		const tasksClose = document.getElementById('tasks-close');
+		if (tasksClose) tasksClose.addEventListener('click', () => toggleTasks(false));
+		const showDone = document.getElementById('tasks-show-done');
+		if (showDone) {
+			showDone.addEventListener('change', () => {
+				showDoneTasks = showDone.checked;
+				renderTasks();
+			});
+		}
+		const quick = document.getElementById('task-quick');
+		if (quick) {
+			quick.addEventListener('keydown', (e) => {
+				if ('Enter' !== e.key) return;
+				e.preventDefault();
+				quickAddTask(quick.value);
+				quick.value = '';
+			});
+		}
+		const taskSave = document.getElementById('task-save-btn');
+		if (taskSave) taskSave.addEventListener('click', saveTaskFromModal);
+		const taskDelete = document.getElementById('task-delete-btn');
+		if (taskDelete) {
+			taskDelete.addEventListener('click', () => {
+				if (!editingTask) return;
+				const doomed = editingTask;
+				document.getElementById('task-modal').classList.remove('show');
+				editingTask = null;
+				removeTask(doomed);
+			});
+		}
+		const dueClear = document.getElementById('task-due-clear');
+		if (dueClear) {
+			dueClear.addEventListener('click', () => {
+				document.getElementById('task-due').value = '';
+				document.getElementById('task-due-time').value = '';
+			});
+		}
+		['task-modal-close', 'task-cancel-btn'].forEach(id => {
+			const el = document.getElementById(id);
+			if (el) {
+				el.addEventListener('click', () => {
+					document.getElementById('task-modal').classList.remove('show');
+					editingTask = null;
+				});
+			}
+		});
+
+		// A route straight to the tasks, so the toolbar button lands on them
+		// rather than on the grid with a panel to find.
+		if (window.location.hash.includes('task')) toggleTasks(true);
 		document.querySelectorAll('.event-rsvp-btn').forEach(btn => {
 			btn.addEventListener('click', () => answerInvitation(btn.dataset.partstat));
 		});
@@ -1329,6 +1506,341 @@ function repeatPayload(startDate, allDay) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Tasks
+ *
+ * A VTODO lives in the same collections as an event, under the same
+ * account - which is why this is not a plugin of its own. It is not the
+ * same shape though: a task is a due date, a state and a proportion done,
+ * not a span in a grid, so it gets a list rather than a place on the
+ * calendar. Sorting is by when it is due and then by priority, because
+ * that is the order the day actually has to be worked in.
+ * ------------------------------------------------------------------ */
+let knownTasks = [];
+let taskLists = [];
+let showDoneTasks = false;
+
+function taskPanel() {
+	return document.getElementById('tasks-panel');
+}
+
+function tasksShowing() {
+	const panel = taskPanel();
+	return !!panel && 'none' !== panel.style.display;
+}
+
+function toggleTasks(open) {
+	const panel = taskPanel();
+	const btn = document.getElementById('tasks-panel-btn');
+	if (!panel) return;
+	const wanted = (undefined === open) ? !tasksShowing() : !!open;
+	panel.style.display = wanted ? 'flex' : 'none';
+	if (btn) btn.setAttribute('aria-expanded', String(wanted));
+	if (wanted) loadTasks();
+}
+
+function loadTasks() {
+	if (!rl.pluginRemoteRequest) return;
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			renderTasks((res && res.error) || 'Could not read the tasks.');
+			return;
+		}
+		knownTasks = res.tasks || [];
+		taskLists = res.lists || [];
+		renderTasks();
+	}, 'GetTasks', {});
+}
+
+// Midnight tonight, and the end of the week, in the reader's own timezone -
+// which is what "today" and "this week" mean to the person reading.
+function endOfToday() {
+	const end = new Date();
+	end.setHours(23, 59, 59, 999);
+	return end;
+}
+
+function taskDue(task) {
+	if (!task || !task.due) return null;
+	// A task due on a date is due at the end of that day, not at its start:
+	// "Friday" is not overdue on Friday morning.
+	if (/^\d{4}-\d{2}-\d{2}$/.test(task.due)) {
+		const parts = task.due.split('-').map(n => parseInt(n, 10));
+		return new Date(parts[0], parts[1] - 1, parts[2], 23, 59, 59, 999);
+	}
+	const when = new Date(task.due);
+	return isNaN(when) ? null : when;
+}
+
+function taskIsDone(task) {
+	return 'COMPLETED' === (task.status || '').toUpperCase();
+}
+
+function taskGroup(task) {
+	if (taskIsDone(task)) return 'Done';
+	if ('CANCELLED' === (task.status || '').toUpperCase()) return 'Dropped';
+	const due = taskDue(task);
+	if (!due) return 'No date';
+	const today = endOfToday();
+	if (due < new Date()) return 'Overdue';
+	if (due <= today) return 'Today';
+	const week = new Date(today.getTime() + 6 * 86400000);
+	return (due <= week) ? 'This week' : 'Later';
+}
+
+const TASK_GROUPS = ['Overdue', 'Today', 'This week', 'Later', 'No date', 'Dropped', 'Done'];
+
+function sayDue(task) {
+	const due = taskDue(task);
+	if (!due) return '';
+	const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(task.due);
+	const opts = dateOnly
+		? { weekday: 'short', day: 'numeric', month: 'short' }
+		: { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
+	return due.toLocaleDateString(undefined, opts);
+}
+
+function renderTasks(message) {
+	const box = document.getElementById('tasks-list');
+	if (!box) return;
+	box.textContent = '';
+
+	if (message) {
+		const err = document.createElement('div');
+		err.className = 'task-empty';
+		err.textContent = message;
+		box.appendChild(err);
+		return;
+	}
+
+	const wanted = knownTasks.filter(t => showDoneTasks || !taskIsDone(t));
+	if (!wanted.length) {
+		const none = document.createElement('div');
+		none.className = 'task-empty';
+		none.textContent = knownTasks.length
+			? 'Nothing outstanding.'
+			: (taskLists.length
+				? 'No tasks yet. Add one below.'
+				: 'No task list yet - make a calendar that holds tasks, under Calendars.');
+		box.appendChild(none);
+		return;
+	}
+
+	// Due first, then the more urgent of two things due the same day. A task
+	// with no priority sorts after one with any, which is what 0 means in
+	// RFC 5545: undefined, not lowest.
+	const order = (task) => {
+		const due = taskDue(task);
+		return due ? due.getTime() : Number.MAX_SAFE_INTEGER;
+	};
+	wanted.sort((a, b) => (order(a) - order(b))
+		|| ((a.priority || 10) - (b.priority || 10))
+		|| (a.summary || '').localeCompare(b.summary || ''));
+
+	TASK_GROUPS.forEach(group => {
+		const inGroup = wanted.filter(t => taskGroup(t) === group);
+		if (!inGroup.length) return;
+		const head = document.createElement('div');
+		head.className = 'task-group';
+		head.textContent = group + ' (' + inGroup.length + ')';
+		box.appendChild(head);
+		inGroup.forEach(task => box.appendChild(taskRow(task, group)));
+	});
+}
+
+function taskRow(task, group) {
+	const row = document.createElement('div');
+	row.className = 'task-row' + (taskIsDone(task) ? ' is-done' : '');
+
+	const tick = document.createElement('input');
+	tick.type = 'checkbox';
+	tick.checked = taskIsDone(task);
+	tick.disabled = !!task.readOnly;
+	tick.setAttribute('aria-label', (taskIsDone(task) ? 'Reopen ' : 'Finish ') + (task.summary || ''));
+	tick.addEventListener('click', (e) => e.stopPropagation());
+	tick.addEventListener('change', () => finishTask(task, tick.checked));
+
+	const main = document.createElement('div');
+	main.className = 'task-main';
+	const title = document.createElement('div');
+	title.className = 'task-title';
+	title.textContent = task.summary || 'Untitled task';
+	main.appendChild(title);
+
+	const meta = document.createElement('div');
+	meta.className = 'task-meta';
+	if (task.calendarColor || task.calendarName) {
+		const dot = document.createElement('span');
+		dot.className = 'task-dot';
+		dot.style.background = task.calendarColor || 'var(--cal-event-bg)';
+		dot.title = task.calendarName || task.calendar || '';
+		meta.appendChild(dot);
+	}
+	const when = sayDue(task);
+	if (when) {
+		const due = document.createElement('span');
+		due.textContent = when;
+		if ('Overdue' === group) due.className = 'task-late';
+		meta.appendChild(due);
+	}
+	// 1 to 4 is high in RFC 5545, 5 is normal, 6 to 9 low. Only the ones
+	// worth interrupting the reader for are shown.
+	if (task.priority && 5 > task.priority) {
+		const bang = document.createElement('span');
+		bang.className = 'task-bang';
+		bang.textContent = '!';
+		bang.title = 'High priority';
+		meta.appendChild(bang);
+	}
+	(task.categories || []).slice(0, 3).forEach(cat => {
+		const tag = document.createElement('span');
+		tag.textContent = cat;
+		meta.appendChild(tag);
+	});
+	if (meta.childNodes.length) main.appendChild(meta);
+
+	if (task.percent && !taskIsDone(task)) {
+		const bar = document.createElement('div');
+		bar.className = 'task-bar';
+		const fill = document.createElement('span');
+		fill.style.width = Math.max(0, Math.min(100, task.percent)) + '%';
+		bar.appendChild(fill);
+		main.appendChild(bar);
+	}
+
+	row.appendChild(tick);
+	row.appendChild(main);
+	if (!task.readOnly) row.addEventListener('click', () => openTaskModal(task));
+	return row;
+}
+
+let editingTask = null;
+
+function openTaskModal(task) {
+	editingTask = task || null;
+	const modal = document.getElementById('task-modal');
+	if (!modal) return;
+
+	document.getElementById('task-modal-title').textContent = task ? 'Task' : 'New task';
+	document.getElementById('task-title').value = task ? (task.summary || '') : '';
+	document.getElementById('task-description').value = task ? (task.description || '') : '';
+	document.getElementById('task-categories').value = task ? (task.categories || []).join(', ') : '';
+	document.getElementById('task-status').value = task ? (task.status || 'NEEDS-ACTION') : 'NEEDS-ACTION';
+	document.getElementById('task-percent').value = task ? (task.percent || 0) : 0;
+	document.getElementById('task-priority').value = task ? String(task.priority || 0) : '0';
+
+	// A date due and a time due are the same field here; which one was stored
+	// is the difference between "Friday" and "Friday at four".
+	const due = task ? taskDue(task) : null;
+	const dateOnly = !task || !task.due || /^\d{4}-\d{2}-\d{2}$/.test(task.due);
+	document.getElementById('task-due').value = due ? formatDateOnly(due) : '';
+	document.getElementById('task-due-time').value = (due && !dateOnly)
+		? String(due.getHours()).padStart(2, '0') + ':' + String(due.getMinutes()).padStart(2, '0')
+		: '';
+
+	const list = document.getElementById('task-list');
+	list.textContent = '';
+	taskLists.filter(l => l.writable).forEach(l => {
+		const option = document.createElement('option');
+		option.value = l.name;
+		option.textContent = l.displayName || l.name;
+		list.appendChild(option);
+	});
+	list.value = (task && task.calendar) || taskList();
+	// A task cannot be moved between lists here: that is a DAV MOVE, not a
+	// property, and pretending otherwise would silently do nothing.
+	list.disabled = !!task;
+
+	document.getElementById('task-delete-btn').style.display = task ? 'block' : 'none';
+	modal.classList.add('show');
+	document.getElementById('task-title').focus();
+}
+
+function saveTaskFromModal() {
+	const title = document.getElementById('task-title').value.trim();
+	if (!title) {
+		alert('A task needs a title.');
+		return;
+	}
+	const day = document.getElementById('task-due').value;
+	const time = document.getElementById('task-due-time').value;
+	let dueValue = '';
+	if (day) {
+		if (time) {
+			const parts = day.split('-').map(n => parseInt(n, 10));
+			const clock = time.split(':').map(n => parseInt(n, 10));
+			dueValue = new Date(parts[0], parts[1] - 1, parts[2], clock[0], clock[1]).toISOString();
+		} else {
+			dueValue = day;
+		}
+	}
+
+	saveTask({
+		Uid: editingTask ? editingTask.uid : '',
+		Collection: editingTask ? (editingTask.calendar || '') : document.getElementById('task-list').value,
+		Title: title,
+		Due: dueValue,
+		AllDay: !time,
+		Description: document.getElementById('task-description').value,
+		Categories: document.getElementById('task-categories').value,
+		Status: document.getElementById('task-status').value,
+		Percent: parseInt(document.getElementById('task-percent').value, 10) || 0,
+		Priority: parseInt(document.getElementById('task-priority').value, 10) || 0
+	});
+	document.getElementById('task-modal').classList.remove('show');
+	editingTask = null;
+}
+
+function finishTask(task, done) {
+	saveTask({
+		Uid: task.uid,
+		Collection: task.calendar || '',
+		Status: done ? 'COMPLETED' : 'NEEDS-ACTION',
+		Percent: done ? 100 : 0
+	});
+}
+
+// The list a new task goes on: the first one that can hold tasks, preferring
+// the account's own.
+function taskList() {
+	const writable = taskLists.filter(l => l.writable);
+	const preferred = writable.find(l => l.isDefault) || writable[0];
+	return preferred ? preferred.name : '';
+}
+
+function quickAddTask(title) {
+	if (!title.trim()) return;
+	if (!taskList()) {
+		alert('There is no calendar that holds tasks yet. Make one under Calendars.');
+		return;
+	}
+	saveTask({ Title: title.trim(), Collection: taskList() });
+}
+
+function saveTask(fields) {
+	if (!rl.pluginRemoteRequest) return;
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Could not save that task.');
+		}
+		loadTasks();
+	}, 'SaveTask', fields);
+}
+
+function removeTask(task) {
+	if (!rl.pluginRemoteRequest) return;
+	if (!confirm('Delete "' + (task.summary || 'this task') + '"?')) return;
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Could not delete that task.');
+		}
+		loadTasks();
+	}, 'DeleteTask', { Uid: task.uid, Collection: task.calendar || '' });
+}
+
+/* ------------------------------------------------------------------ *
  * More than one calendar
  *
  * A CalDAV home has always held several collections - a default one, the
@@ -1398,14 +1910,33 @@ function renderCalendarList() {
 			if (calendar) calendar.refetchEvents();
 		});
 
-		const swatch = document.createElement('span');
+		// The swatch is the colour control: a calendar's colour is the thing
+		// that tells four of them apart in a grid, so changing it should not
+		// mean deleting and making it again.
+		const swatch = document.createElement('input');
+		swatch.type = 'color';
 		swatch.className = 'calendar-swatch';
-		swatch.style.background = cal.color || 'var(--cal-event-bg)';
+		swatch.value = cal.color || '#00639a';
+		swatch.disabled = !cal.writable;
+		swatch.title = cal.writable ? 'Colour' : 'Read only';
+		swatch.setAttribute('aria-label', 'Colour of ' + (cal.displayName || cal.name));
+		swatch.addEventListener('click', (e) => e.stopPropagation());
+		swatch.addEventListener('change', () => recolourCalendar(cal, swatch.value));
 
 		const name = document.createElement('span');
 		name.className = 'calendar-name';
 		name.textContent = cal.displayName || cal.name;
-		name.title = (cal.components || []).join(', ') + (cal.writable ? '' : ' - read only');
+		name.title = (cal.components || []).join(', ')
+			+ (cal.writable ? ' - double-click to rename' : ' - read only');
+		if (cal.writable) {
+			name.addEventListener('dblclick', (e) => {
+				e.preventDefault();
+				const wanted = prompt('Rename this calendar', cal.displayName || cal.name);
+				if (wanted && wanted.trim() && wanted !== cal.displayName) {
+					changeCalendar(cal, { DisplayName: wanted.trim() });
+				}
+			});
+		}
 
 		row.appendChild(tick);
 		row.appendChild(swatch);
@@ -1426,6 +1957,23 @@ function renderCalendarList() {
 		}
 		box.appendChild(row);
 	});
+}
+
+function recolourCalendar(cal, colour) {
+	if (/^#[0-9a-f]{6}$/i.test(colour || '')) changeCalendar(cal, { Color: colour });
+}
+
+// One PROPPATCH, whichever property is being changed. The server answers 207
+// even when it refused, so the reply is checked rather than assumed.
+function changeCalendar(cal, fields) {
+	if (!rl.pluginRemoteRequest) return;
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Could not change that calendar.');
+		}
+		if (calendar) calendar.refetchEvents();
+	}, 'UpdateCalendar', Object.assign({ Name: cal.name }, fields));
 }
 
 function addCalendar() {
