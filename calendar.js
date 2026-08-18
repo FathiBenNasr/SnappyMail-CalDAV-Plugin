@@ -185,6 +185,8 @@ cal.innerHTML = `
 .event-form-select:disabled, .event-form-input:disabled { opacity: .5; cursor: not-allowed; }
 .event-repeat-days label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .event-modal-narrow { max-width: 460px; }
+.event-modal-footer-stacked { flex-direction: column; align-items: stretch; }
+.event-modal-footer-stacked .event-modal-btn { width: 100%; }
 .event-repeat-end { width: auto; flex: 0 0 auto; }
 .event-repeat-until { width: auto; flex: 0 0 auto; }
 .event-repeat-days { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -264,6 +266,7 @@ cal.innerHTML = `
 					<label class="event-form-label" for="event-scope">Save changes to</label>
 					<select class="event-form-select" id="event-scope">
 						<option value="occurrence">This occurrence only</option>
+						<option value="following">This and all following</option>
 						<option value="series">The whole series</option>
 					</select>
 					<small class="event-field-hint" id="event-scope-hint"></small>
@@ -369,10 +372,11 @@ cal.innerHTML = `
 		<div class="event-modal-body">
 			<p id="scope-modal-intro"></p>
 		</div>
-		<div class="event-modal-footer">
-			<button class="event-modal-btn event-modal-btn-secondary" id="scope-modal-cancel">Cancel</button>
+		<div class="event-modal-footer event-modal-footer-stacked">
 			<button class="event-modal-btn event-modal-btn-primary" id="scope-modal-occurrence">This occurrence</button>
+			<button class="event-modal-btn event-modal-btn-primary" id="scope-modal-following">This and all following</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="scope-modal-series">The whole series</button>
+			<button class="event-modal-btn event-modal-btn-secondary" id="scope-modal-cancel">Cancel</button>
 		</div>
 	</div>
 </div>
@@ -516,6 +520,7 @@ cal.innerHTML = `
 		if (scopeSel) scopeSel.addEventListener('change', refreshScopeUi);
 		const scopeButtons = {
 			'scope-modal-occurrence': 'occurrence',
+			'scope-modal-following': 'following',
 			'scope-modal-series': 'series',
 			'scope-modal-cancel': null
 		};
@@ -863,7 +868,8 @@ function deleteEventFromModal() {
 	// are far enough apart to be worth asking about rather than confirming.
 	if (isRecurring(event)) {
 		askRecurrenceScope('Delete repeating event',
-			'"' + event.title + '" repeats. Delete only this occurrence, or every occurrence?',
+			'"' + event.title + '" repeats. Delete only this occurrence, this one and'
+				+ ' everything after it, or every occurrence?',
 			choice => { if (choice) remove(choice); });
 		return;
 	}
@@ -1129,7 +1135,8 @@ function isRecurring(event) {
 	return !!((event && (event.rrule || (event.extendedProps || {}).rrule)) || '').trim();
 }
 
-// Asks, and calls back with 'occurrence', 'series', or null for cancelled.
+// Asks, and calls back with 'occurrence', 'following', 'series', or null for
+// cancelled.
 function askRecurrenceScope(title, intro, onChoice) {
 	const modal = document.getElementById('scope-modal');
 	if (!modal) {
@@ -1168,7 +1175,8 @@ function refreshScopeUi() {
 	const sel = document.getElementById('event-scope');
 	if (!sel) return;
 	const showing = scopeRowShowing();
-	const one = 'occurrence' === currentScope();
+	const scope = currentScope();
+	const one = 'occurrence' === scope;
 
 	['', 'unit', 'interval', 'end', 'count', 'until'].forEach(id => {
 		const el = repeatEl(id);
@@ -1176,11 +1184,16 @@ function refreshScopeUi() {
 	});
 	repeatDayBoxes().forEach(box => { box.disabled = one; });
 
+	const hints = {
+		occurrence: 'Only this date changes. How the event repeats belongs to the series -'
+			+ ' switch above to change it.',
+		following: 'This date and every one after it. The earlier occurrences are left as they'
+			+ ' are, and the rest becomes a series of its own.',
+		series: 'Every occurrence changes, including any that were moved individually.'
+	};
 	const hint = document.getElementById('event-scope-hint');
 	if (hint) {
-		hint.textContent = one
-			? 'Only this date changes. How the event repeats belongs to the series - switch above to change it.'
-			: 'Every occurrence changes, including any that were moved individually.';
+		hint.textContent = hints[scope] || hints.series;
 		hint.style.display = showing ? 'block' : 'none';
 	}
 }
@@ -1670,8 +1683,8 @@ function updateDraggedEvent(info) {
 		return;
 	}
 	askRecurrenceScope('Repeating event',
-		'"' + event.title + '" repeats. Move only this occurrence, or shift every'
-			+ ' occurrence by the same amount?',
+		'"' + event.title + '" repeats. Move only this occurrence, this one and everything'
+			+ ' after it, or shift every occurrence by the same amount?',
 		choice => {
 			if (!choice) { info.revert(); return; }
 			updateEvent(event, undefined, choice);
@@ -1748,8 +1761,9 @@ function deleteEvent(eventId, scope, recurrenceId) {
 		if (calendar) calendar.refetchEvents();
 	}, 'DeleteCalendarEvent', {
 		EventId: eventId,
-		// Removing one occurrence rewrites the series with that date excluded;
-		// removing the series deletes the resource outright.
+		// Removing one occurrence rewrites the series with that date excluded,
+		// and removing this and all following ends the series just before it;
+		// only removing the series deletes the resource outright.
 		Scope: scope || 'series',
 		RecurrenceId: recurrenceId || ''
 	});

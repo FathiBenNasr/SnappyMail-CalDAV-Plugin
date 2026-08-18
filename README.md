@@ -50,8 +50,9 @@ the dialog had no way to make one, so anything repeating had to be created in
 another client. It now has a **Repeats** row offering the same presets
 Thunderbird does — daily, weekly, every weekday, bi-weekly, monthly, yearly —
 plus **Custom**, which opens interval, weekday and ending fields. The server
-assembles the `RRULE` from those. A single occurrence can also be moved or
-removed without disturbing the rest. See **Repeating events** below.
+assembles the `RRULE` from those. A single occurrence — or an occurrence and
+everything after it — can also be changed without disturbing the rest. See
+**Repeating events** below.
 
 **Reminders work.** `VALARM` was ignored entirely, and the reminder control in
 the event dialog only appended a marker string to the description — it alerted
@@ -126,27 +127,47 @@ whatever it liked on. Every value is a fixed keyword or a bounded integer.
 ### This occurrence, or the whole series
 
 Opening one occurrence of a repeating event shows a **Save changes to** row —
-this occurrence, or the whole series — and dragging, resizing or deleting one
-asks the same question outright before anything is written. The two are not
-close enough to guess between: one cancelled stand-up and a cancelled stand-up
-are different sentences. The row starts on the whole series, which is what the
-dialog did before this existed.
+this occurrence, this and all following, or the whole series — and dragging,
+resizing or deleting one asks the same question outright before anything is
+written. They are not close enough to guess between: one cancelled stand-up and
+a cancelled stand-up are different sentences. The row starts on this
+occurrence, because that is the one that was clicked and the smallest of the
+three.
 
 * **This occurrence** writes a `RECURRENCE-ID` override — a second `VEVENT` in
   the same resource carrying the changed time or title and no `RRULE` — which
   is exactly what every other CalDAV client reads as "this one is different".
   Deleting one adds an `EXDATE` for that date instead of removing the resource,
   and drops any override that was standing on it.
+* **This and all following** cuts the series in two. iCalendar has no way to
+  say "different from here on" inside one rule — a series is one rule from one
+  start — so the stored event is ended just before that occurrence with an
+  `UNTIL`, and everything from it onwards becomes a second event with a new
+  `UID` carrying the rest of the rule. Every calendar client does this the same
+  way. A series counted in occurrences is re-counted across the cut, so the two
+  halves together run exactly as long as the one did. Deleting under this scope
+  writes only the `UNTIL`; cutting at the very first occurrence is the whole
+  event, so that deletes the resource and edits the series in place.
 * **The whole series** edits the master event, so the change reaches every
   occurrence. Dragging or resizing under this scope **shifts the series** by the
   delta rather than dropping it on the date you dragged to; without that,
   dragging next week's stand-up would have moved the entire series onto next
-  week. Overrides another client wrote are left where they are.
+  week. Exclusions travel with it, so dates somebody deleted stay deleted rather
+  than reappearing a day out. Overrides another client wrote are left where
+  they are.
 
-An event another client wrote in its own timezone keeps its `TZID` through
-either kind of edit, and an all-day series gets a `DATE`-valued
-`RECURRENCE-ID`. Retyping either as UTC would freeze it against the next
-daylight-saving change.
+An event another client wrote in its own timezone keeps its `TZID` through any
+of these, and an all-day series gets `DATE`-valued `RECURRENCE-ID`, `EXDATE` and
+`UNTIL` to match its `DTSTART`. Retyping either as UTC would freeze it against
+the next daylight-saving change — except `UNTIL` on a timed series, which RFC
+5545 §3.3.10 requires to be UTC whatever zone the start is written in.
+
+Splitting writes two resources, so it writes the new half first: if that fails
+the stored series is still whole, and if truncating the original then fails the
+new half is taken away again rather than left standing alongside the dates it
+was meant to replace. Overrides after the cut are not carried across — they are
+tied by `RECURRENCE-ID` to instants of the old rule, and being free of them is
+the point of splitting.
 
 Some rules are more than these controls can show — "the second Monday of the
 month", "the last weekday", anything with `BYSETPOS` or `BYMONTHDAY`. Those are

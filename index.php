@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.7',
+		VERSION  = '2.8',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -118,8 +118,228 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * Returns the serialised VCALENDAR, or null when the payload cannot be
 	 * parsed so the caller can fall back to building a fresh object.
 	 */
+	/**
+	 * The VEVENT carrying the series: the one without a RECURRENCE-ID. The
+	 * others are overrides, each standing for a single occurrence of it.
+	 *
+	 * @return \Sabre\VObject\Component\VEvent|null
+	 */
+	private function seriesMaster(\Sabre\VObject\Component\VCalendar $oVCal)
+	{
+		foreach ($oVCal->VEVENT as $oCandidate) {
+			if (!isset($oCandidate->{'RECURRENCE-ID'})) {
+				return $oCandidate;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Keep the EXDATEs on one side of an instant and drop the rest, which is
+	 * what splitting a series has to do with them: a date somebody deleted
+	 * belongs to whichever half now contains it.
+	 */
+	private function keepExdates($oEvent, int $iWhen, bool $bAfter) : void
+	{
+		$aKept = array();
+		foreach ($oEvent->select('EXDATE') as $oExdate) {
+			foreach ($oExdate->getDateTimes() as $oDate) {
+				if (($oDate->getTimestamp() >= $iWhen) === $bAfter) {
+					$aKept[] = $oDate;
+				}
+			}
+		}
+		$oEvent->remove('EXDATE');
+		if ($aKept) {
+			$bTimed = !isset($oEvent->DTSTART) || $oEvent->DTSTART->hasTime();
+			$oExdate = $oEvent->add('EXDATE', '19700101', $bTimed ? array() : array('VALUE' => 'DATE'));
+			$oExdate->setDateTimes($aKept);
+		}
+	}
+
+	/**
+	 * How many occurrences a rule produces before an instant. Needed because a
+	 * series counted in occurrences cannot simply be cut in two: both halves
+	 * would carry the same COUNT and together run twice as long as the series
+	 * ever did.
+	 */
+	private function countBefore(string $sRule, \DateTimeInterface $oStart, int $iWhen) : int
+	{
+		$iCount = 0;
+		try {
+			foreach (new \Sabre\VObject\Recur\RRuleIterator($sRule, $oStart) as $oDate) {
+				if (!$oDate || $oDate->getTimestamp() >= $iWhen) {
+					break;
+				}
+				if (10000 < ++$iCount) {
+					break;
+				}
+			}
+		} catch (\Throwable $oException) {
+			// An unreadable rule counts as nothing before the cut, which leaves
+			// the tail its full COUNT - too many, but never too few.
+		}
+		return $iCount;
+	}
+
+	/**
+	 * End a series just before one of its occurrences, taking everything at or
+	 * after that instant out of it. Returns false when there would be nothing
+	 * left - the cut is at or before the first occurrence - so the caller can
+	 * decide what "the rest of it" means when the rest is all of it.
+	 */
+	private function truncateSeriesAt(\Sabre\VObject\Component\VCalendar $oVCal, $oMaster, int $iWhen) : bool
+	{
+		if (!isset($oMaster->RRULE) || !isset($oMaster->DTSTART)
+		 || $oMaster->DTSTART->getDateTime()->getTimestamp() >= $iWhen) {
+			return false;
+		}
+
+		// UNTIL is inclusive and, for a timed series, always UTC (RFC 5545
+		// 3.3.10) whatever zone DTSTART is written in. COUNT has to go with it:
+		// the two cannot appear in one rule, and the earlier of them is the one
+		// that would have applied anyway.
+		$bTimed = $oMaster->DTSTART->hasTime();
+		$aParts = $oMaster->RRULE->getParts();
+		unset($aParts['COUNT']);
+		$aParts['UNTIL'] = $bTimed
+			? \gmdate('Ymd\THis\Z', $iWhen - 1)
+			: \gmdate('Ymd', $iWhen - 86400);
+		$oMaster->RRULE->setParts($aParts);
+
+		// Overrides and exclusions past the cut describe dates this half no
+		// longer has.
+		$aStale = array();
+		foreach ($oVCal->VEVENT as $oCandidate) {
+			if (isset($oCandidate->{'RECURRENCE-ID'})
+			 && $oCandidate->{'RECURRENCE-ID'}->getDateTime()->getTimestamp() >= $iWhen) {
+				$aStale[] = $oCandidate;
+			}
+		}
+		foreach ($aStale as $oCandidate) {
+			$oVCal->remove($oCandidate);
+		}
+		$this->keepExdates($oMaster, $iWhen, false);
+
+		// The guests' clients need to be told the series now stops earlier.
+		$oMaster->SEQUENCE = ((int) ((string) ($oMaster->SEQUENCE ?? '0'))) + 1;
+		$oMaster->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+		return true;
+	}
+
+	/**
+	 * Cut a series in two at one of its occurrences: the stored object keeps
+	 * everything before the cut, and a second one - new UID, everything else
+	 * inherited - starts at that occurrence and carries the rest of the rule.
+	 * Returns the new object, or null when there is nothing to cut off: not a
+	 * series, or a cut at its first occurrence, where the rest *is* all of it.
+	 *
+	 * This is what "this and all following" has to be in iCalendar. A series is
+	 * one rule from one start, with no way to say "different from here on"
+	 * inside it, so every calendar client splits instead. The overrides after
+	 * the cut are not carried over: they are tied by RECURRENCE-ID to instants
+	 * of the old rule, and the whole point of the split is that the new half
+	 * need not keep them.
+	 *
+	 * @return \Sabre\VObject\Component\VCalendar|null
+	 */
+	private function splitSeries(\Sabre\VObject\Component\VCalendar $oVCal, $oMaster, string $sRecurrenceId)
+	{
+		try {
+			$iWhen = (new \DateTime($sRecurrenceId, new \DateTimeZone('UTC')))->getTimestamp();
+		} catch (\Throwable $oException) {
+			return null;
+		}
+		if (!isset($oMaster->RRULE) || !isset($oMaster->DTSTART)) {
+			return null;
+		}
+		$oStart = $oMaster->DTSTART->getDateTime();
+		if ($oStart->getTimestamp() >= $iWhen) {
+			return null;
+		}
+
+		$aParts = $oMaster->RRULE->getParts();
+		if (isset($aParts['COUNT'])) {
+			$aParts['COUNT'] = \max(1, ((int) $aParts['COUNT'])
+				- $this->countBefore((string) $oMaster->RRULE, $oStart, $iWhen));
+		}
+
+		// Cloning the whole object rather than building one keeps the calendar
+		// around the event - VTIMEZONE above all, without which a TZID on the
+		// new half names a zone nothing defines.
+		$oTailCal = clone $oVCal;
+		$oTail = $this->seriesMaster($oTailCal);
+		if (!$oTail) {
+			return null;
+		}
+		$aDrop = array();
+		foreach ($oTailCal->VEVENT as $oCandidate) {
+			if (isset($oCandidate->{'RECURRENCE-ID'})) {
+				$aDrop[] = $oCandidate;
+			}
+		}
+		foreach ($aDrop as $oCandidate) {
+			$oTailCal->remove($oCandidate);
+		}
+
+		// The new half begins at the occurrence that was cut on, written the
+		// way the old one wrote its start - same zone, same value type - and
+		// keeping the length it had.
+		$oZone   = $oStart->getTimezone() ?: new \DateTimeZone('UTC');
+		$iLength = isset($oTail->DTEND)
+			? $oTail->DTEND->getDateTime()->getTimestamp() - $oStart->getTimestamp()
+			: 0;
+		$oTail->DTSTART->setDateTime((new \DateTime('@' . $iWhen))->setTimezone($oZone));
+		if (isset($oTail->DTEND)) {
+			$oTail->DTEND->setDateTime((new \DateTime('@' . ($iWhen + $iLength)))->setTimezone($oZone));
+		}
+
+		$oTail->RRULE->setParts($aParts);
+		$this->keepExdates($oTail, $iWhen, true);
+
+		// A new resource, so a new identity: reusing the UID would make the two
+		// halves the same event, and the server would store only one of them.
+		$sSuffix = \strstr((string) $oMaster->UID, '@');
+		$oTail->UID = \uniqid('event-') . '-' . \bin2hex(\random_bytes(4)) . ($sSuffix ?: '');
+		$oTail->SEQUENCE = 0;
+		$oTail->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+
+		if (!$this->truncateSeriesAt($oVCal, $oMaster, $iWhen)) {
+			return null;
+		}
+		return $oTailCal;
+	}
+
+	/**
+	 * The stored series with everything from one occurrence onwards removed.
+	 * Returns the rewritten object, an empty string when the cut would leave
+	 * nothing and the resource should simply go, or null if it cannot be read.
+	 */
+	private function truncateSeriesFrom(string $sExisting, string $sRecurrenceId) : ?string
+	{
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sExisting, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VEVENT)) {
+				return null;
+			}
+			$oMaster = $this->seriesMaster($oVCal);
+			if (!$oMaster) {
+				return null;
+			}
+			$iWhen = (new \DateTime($sRecurrenceId, new \DateTimeZone('UTC')))->getTimestamp();
+
+			// Nothing would be left: "this and all following" starting at the
+			// first occurrence is the whole event.
+			return $this->truncateSeriesAt($oVCal, $oMaster, $iWhen) ? $oVCal->serialize() : '';
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'truncate failed: ' . $oException->getMessage());
+			return null;
+		}
+	}
+
 	private function applyEventEdit(string $sExisting, \RainLoop\Model\Account $oAccount,
-		string $sTitle, string $sStart, string $sEnd, bool $bAllDay) : ?string
+		string $sTitle, string $sStart, string $sEnd, bool $bAllDay,
+		?string &$sTailIcs = null, ?string &$sTailUid = null) : ?string
 	{
 		try {
 			$oVCal = \Sabre\VObject\Reader::read($sExisting, \Sabre\VObject\Reader::OPTION_FORGIVING);
@@ -127,28 +347,31 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				return null;
 			}
 
-			// The master is the VEVENT without a RECURRENCE-ID; the others are
-			// overrides, each replacing one occurrence of it.
-			$oMaster = null;
-			foreach ($oVCal->VEVENT as $oCandidate) {
-				if (!isset($oCandidate->{'RECURRENCE-ID'})) {
-					$oMaster = $oCandidate;
-					break;
-				}
-			}
-			$oMaster = $oMaster ?: $oVCal->VEVENT;
+			$oMaster = $this->seriesMaster($oVCal) ?: $oVCal->VEVENT;
 			$oEvent = $oMaster;
 
 			// "This occurrence" edits the override for that one date, splitting
-			// a fresh one off the series if there is not one yet. "The series"
-			// - the default, and all there used to be - edits the master.
+			// a fresh one off the series if there is not one yet. "This and all
+			// following" cuts the series in two and edits the second half, a
+			// new object of its own. "The whole series" - the default, and all
+			// there used to be - edits the master.
+			$sScope = \strtolower((string) $this->jsonParam('Scope', 'series'));
 			$sRecurrenceId = \trim((string) $this->jsonParam('RecurrenceId', ''));
-			$bOccurrence = 'occurrence' === \strtolower((string) $this->jsonParam('Scope', 'series'))
-				&& \strlen($sRecurrenceId) && isset($oMaster->RRULE);
+			$bSeries = \strlen($sRecurrenceId) && isset($oMaster->RRULE);
+			$bOccurrence = $bSeries && 'occurrence' === $sScope;
+			$oTailCal = null;
 			if ($bOccurrence) {
 				$oEvent = $this->occurrenceOverride($oVCal, $oMaster, $sRecurrenceId);
 				if (null === $oEvent) {
 					return null;
+				}
+			} elseif ($bSeries && 'following' === $sScope) {
+				// A cut at the first occurrence splits nothing off, and falling
+				// through to the master is the right answer there: everything
+				// from the first occurrence on is the whole series.
+				$oTailCal = $this->splitSeries($oVCal, $oMaster, $sRecurrenceId);
+				if ($oTailCal) {
+					$oEvent = $this->seriesMaster($oTailCal);
 				}
 			}
 
@@ -191,6 +414,23 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					}
 					// No DTEND means the length is a DURATION, which the shift
 					// leaves correct on its own.
+
+					// Exceptions and extra dates are stated as instants of this
+					// same series, so a series that moves takes them with it.
+					// Left behind, they would strike out dates the series no
+					// longer falls on and let the ones somebody deleted return.
+					foreach (array('EXDATE', 'RDATE') as $sDates) {
+						foreach ($oEvent->select($sDates) as $oProperty) {
+							$aMoved = array();
+							foreach ($oProperty->getDateTimes() as $oDate) {
+								$aMoved[] = (new \DateTime('@' . ($oDate->getTimestamp() + ($iNow - $iWas))))
+									->setTimezone($oDate->getTimezone() ?: $oZone);
+							}
+							if ($aMoved) {
+								$oProperty->setDateTimes($aMoved);
+							}
+						}
+					}
 					$bShifted = true;
 				} catch (\Throwable $oIgnored) {
 					// Unreadable occurrence: fall through and take the times as
@@ -318,6 +558,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			}
 			$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
 
+			if ($oTailCal) {
+				$sTailIcs = $oTailCal->serialize();
+				$sTailUid = (string) $oEvent->UID;
+			}
 			return $oVCal->serialize();
 		} catch (\Throwable $oException) {
 			\SnappyMail\Log::notice('CalDAV', 'update parse failed: ' . $oException->getMessage());
@@ -390,13 +634,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				return null;
 			}
 
-			$oMaster = null;
-			foreach ($oVCal->VEVENT as $oCandidate) {
-				if (!isset($oCandidate->{'RECURRENCE-ID'})) {
-					$oMaster = $oCandidate;
-					break;
-				}
-			}
+			$oMaster = $this->seriesMaster($oVCal);
 			if (!$oMaster || !isset($oMaster->RRULE) || !isset($oMaster->DTSTART)) {
 				return null;
 			}
@@ -1847,11 +2085,13 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// VALARM, ORGANIZER and ATTENDEE, and any RRULE - so dragging a
 			// recurring event in the grid flattened it to a single occurrence.
 			$sICS = null;
+			$sTailIcs = null;
+			$sTailUid = null;
 			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
 			if (200 === (int) $aFetch['code'] && \strlen((string) $aFetch['body'])) {
 				$sICS = $this->applyEventEdit(
 					(string) $aFetch['body'], $oAccount, $sTitle, $sStartFormatted,
-					$sEndFormatted, $bAllDay
+					$sEndFormatted, $bAllDay, $sTailIcs, $sTailUid
 				);
 			}
 			if (null === $sICS) {
@@ -1861,6 +2101,24 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				// and the untouched original is still on the server.
 				return $this->jsonResponse(__FUNCTION__, ['success' => false,
 					'error' => 'Could not read this event from the server, so it was left unchanged.']);
+			}
+
+			// "This and all following" splits the series, so what comes after
+			// the cut is a second resource. Write it first: if that fails the
+			// stored series is still whole and nothing has been lost. If
+			// truncating the original then fails, take it away again rather
+			// than leave the same occurrences standing in two places.
+			$sTailUrl = '';
+			if (\strlen((string) $sTailIcs) && \strlen((string) $sTailUid)) {
+				$sTailUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/'
+					. ($aConfig['Collection'] ?? 'Default') . '/' . \rawurlencode($sTailUid) . '.ics';
+				$aTail = $this->makeCalDAVRequest($sTailUrl, 'PUT', $aConfig['User'], $sPassword,
+					$sTailIcs, ['Content-Type: text/calendar; charset=utf-8']);
+				if (!\in_array((int) $aTail['code'], array(200, 201, 204), true)) {
+					return $this->jsonResponse(__FUNCTION__, ['success' => false,
+						'error' => 'Could not store the rest of the series (' . $aTail['code']
+							. '), so the event was left unchanged.']);
+				}
 			}
 
 			$result = $this->makeCalDAVRequest(
@@ -1875,6 +2133,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			if ($result['code'] === 201 || $result['code'] === 204) {
 				return $this->jsonResponse(__FUNCTION__, ['success' => true]);
 			} else {
+				if (\strlen($sTailUrl)) {
+					$this->makeCalDAVRequest($sTailUrl, 'DELETE', $aConfig['User'], $sPassword);
+				}
 				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'CalDAV error: ' . $result['code']]);
 			}
 			
@@ -2048,12 +2309,17 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// Removing one occurrence of a series means editing the object, not
 			// deleting it: the whole series lives in this one resource, so a
 			// DELETE here would take every other occurrence with it.
+			// "This and all following" is the same kind of edit: the series
+			// is ended just before that occurrence rather than removed.
+			$sScope = \strtolower((string) $this->jsonParam('Scope', 'series'));
 			$sRecurrenceId = \trim((string) $this->jsonParam('RecurrenceId', ''));
-			if ('occurrence' === \strtolower((string) $this->jsonParam('Scope', 'series'))
-			 && \strlen($sRecurrenceId)) {
+			if (\strlen($sRecurrenceId) && ('occurrence' === $sScope || 'following' === $sScope)) {
 				$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
-				$sICS = (200 === (int) $aFetch['code'] && \strlen((string) $aFetch['body']))
-					? $this->excludeOccurrence((string) $aFetch['body'], $sRecurrenceId)
+				$sBody = (200 === (int) $aFetch['code']) ? (string) $aFetch['body'] : '';
+				$sICS = \strlen($sBody)
+					? ('occurrence' === $sScope
+						? $this->excludeOccurrence($sBody, $sRecurrenceId)
+						: $this->truncateSeriesFrom($sBody, $sRecurrenceId))
 					: null;
 				if (null === $sICS) {
 					// Falling back to a whole-resource DELETE here would answer
@@ -2062,12 +2328,17 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 						'error' => 'Could not read this series from the server, so nothing was removed.']);
 				}
 
-				$result = $this->makeCalDAVRequest($sEventUrl, 'PUT', $aConfig['User'], $sPassword,
-					$sICS, ['Content-Type: text/calendar; charset=utf-8']);
-				return $this->jsonResponse(__FUNCTION__,
-					(201 === $result['code'] || 204 === $result['code'] || 200 === $result['code'])
-						? ['success' => true]
-						: ['success' => false, 'error' => 'CalDAV error: ' . $result['code']]);
+				// An empty result means the cut lands on the first occurrence,
+				// so there is no series left to keep - the DELETE below is what
+				// "everything from here on" actually means in that case.
+				if (\strlen($sICS)) {
+					$result = $this->makeCalDAVRequest($sEventUrl, 'PUT', $aConfig['User'], $sPassword,
+						$sICS, ['Content-Type: text/calendar; charset=utf-8']);
+					return $this->jsonResponse(__FUNCTION__,
+						(201 === $result['code'] || 204 === $result['code'] || 200 === $result['code'])
+							? ['success' => true]
+							: ['success' => false, 'error' => 'CalDAV error: ' . $result['code']]);
+				}
 			}
 
 			$result = $this->makeCalDAVRequest(
