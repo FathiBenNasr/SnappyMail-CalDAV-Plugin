@@ -219,6 +219,21 @@ cal.innerHTML = `
 .place-result:last-child { border-bottom: none; }
 .place-result:hover, .place-result.is-active { background: var(--cal-bg-tertiary); }
 .place-status { margin-top: 12px; font-size: 13px; opacity: .75; }
+
+/* Calendars */
+.cal-calendars { background: var(--cal-bg-primary); border-bottom: 1px solid var(--cal-border); padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+.calendar-list { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+.calendar-row { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.calendar-swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; border: 1px solid var(--cal-border); }
+.calendar-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calendar-drop { border: 0; background: none; color: inherit; cursor: pointer; opacity: .5; font-size: 15px; line-height: 1; padding: 0 4px; }
+.calendar-drop:hover { opacity: 1; color: var(--cal-danger); }
+.calendar-new { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; }
+.calendar-new input[type="text"] { padding: 6px 10px; border: 1px solid var(--cal-border); border-radius: 6px; background: var(--cal-bg-primary); color: var(--cal-text-primary); }
+.calendar-new input[type="color"] { width: 34px; height: 30px; padding: 0; border: 1px solid var(--cal-border); border-radius: 6px; background: none; cursor: pointer; }
+.calendar-new label { display: inline-flex; align-items: center; gap: 4px; }
+.calendar-new button { padding: 6px 12px; border: 1px solid var(--cal-border); border-radius: 6px; background: var(--cal-bg-tertiary); color: var(--cal-text-primary); cursor: pointer; }
+.calendar-new button:hover { border-color: var(--cal-accent); }
 </style>
 <div class="cal-wrapper">
 <div class="cal-main">
@@ -227,8 +242,21 @@ cal.innerHTML = `
 <a href="#/mailbox/INBOX" class="cal-back-btn" title="Back to Inbox">← Back</a>
 <h1 class="cal-title"><span style="font-size:32px">📅</span><span>Calendar</span></h1>
 <button class="cal-add-btn" id="new-event-btn"><span style="font-size:20px">+</span> Add</button>
+<button class="cal-add-btn" id="calendar-panel-btn" title="Show, hide and make calendars"
+	aria-expanded="false">📚 Calendars</button>
 </div>
 <div class="cal-header-right" id="cal-account-switcher"></div>
+</div>
+<div class="cal-calendars" id="calendar-panel" style="display:none;">
+	<div class="calendar-list" id="calendar-list"></div>
+	<div class="calendar-new">
+		<input type="text" id="calendar-new-name" placeholder="New calendar" aria-label="New calendar name">
+		<input type="color" id="calendar-new-color" value="#00639a" aria-label="Colour">
+		<label><input type="checkbox" class="calendar-new-comp" value="VEVENT" checked><span>Events</span></label>
+		<label><input type="checkbox" class="calendar-new-comp" value="VTODO"><span>Tasks</span></label>
+		<label><input type="checkbox" class="calendar-new-comp" value="VJOURNAL"><span>Notes</span></label>
+		<button type="button" id="calendar-new-add">Create</button>
+	</div>
 </div>
 <div class="cal-content">
 			<div id="fc-calendar"></div>
@@ -560,6 +588,18 @@ cal.innerHTML = `
 		if (scopeSel) scopeSel.addEventListener('change', refreshScopeUi);
 		const skipAdd = document.getElementById('event-skip-add');
 		if (skipAdd) skipAdd.addEventListener('click', addSkippedDate);
+
+		const panelBtn = document.getElementById('calendar-panel-btn');
+		const panel = document.getElementById('calendar-panel');
+		if (panelBtn && panel) {
+			panelBtn.addEventListener('click', () => {
+				const open = 'none' === panel.style.display;
+				panel.style.display = open ? 'flex' : 'none';
+				panelBtn.setAttribute('aria-expanded', String(open));
+			});
+		}
+		const calAdd = document.getElementById('calendar-new-add');
+		if (calAdd) calAdd.addEventListener('click', addCalendar);
 		document.querySelectorAll('.event-rsvp-btn').forEach(btn => {
 			btn.addEventListener('click', () => answerInvitation(btn.dataset.partstat));
 		});
@@ -910,7 +950,8 @@ function sendCancellation() {
 		alert(res.notified
 			? 'Meeting cancelled. The guests have been notified.'
 			: 'Meeting cancelled.');
-	}, 'CancelCalendarEvent', { EventId: eventId, Reason: reason });
+	}, 'CancelCalendarEvent', { EventId: eventId, Reason: reason,
+		Collection: currentEditingEvent?.extendedProps?.calendar || '' });
 }
 
 function deleteEventFromModal() {
@@ -920,7 +961,8 @@ function deleteEventFromModal() {
 	const remove = (scope) => {
 		const eventId = event.id || event.extendedProps?.uid;
 		event.remove();
-		deleteEvent(eventId, scope, event.extendedProps?.recurrenceId);
+		deleteEvent(eventId, scope, event.extendedProps?.recurrenceId,
+			event.extendedProps?.calendar);
 		document.getElementById('event-modal').classList.remove('show');
 		currentEditingEvent = null;
 	};
@@ -1284,6 +1326,147 @@ function repeatPayload(startDate, allDay) {
 		RepeatCount: Math.max(1, parseInt(repeatEl('count').value, 10) || 1),
 		RepeatUntil: repeatEl('until').value
 	};
+}
+
+/* ------------------------------------------------------------------ *
+ * More than one calendar
+ *
+ * A CalDAV home has always held several collections - a default one, the
+ * scheduling Inbox and Outbox, and whatever else the user made - and this
+ * plugin only ever read whichever one the URL template happened to name.
+ * The picker lists them, remembers which are showing, and colours the grid
+ * by the calendar an event came out of.
+ *
+ * Which are showing is kept in this browser rather than on the server:
+ * it is a view preference, not a property of the calendar, and the same
+ * account read from a phone may reasonably want a different answer.
+ * ------------------------------------------------------------------ */
+const CALENDARS_SHOWN_KEY = 'caldav-calendars-shown';
+let knownCalendars = [];
+
+function shownCalendars() {
+	try {
+		const saved = JSON.parse(localStorage.getItem(CALENDARS_SHOWN_KEY) || '[]');
+		return Array.isArray(saved) ? saved.filter(n => 'string' === typeof n) : [];
+	} catch (e) {
+		return [];
+	}
+}
+
+function setShownCalendars(names) {
+	try { localStorage.setItem(CALENDARS_SHOWN_KEY, JSON.stringify(names)); }
+	catch (e) { /* private browsing; the default calendar still shows */ }
+}
+
+// The calendar a new event is written to: whichever single one is showing, or
+// the account's own when several are.
+function writeCalendar() {
+	const shown = shownCalendars().filter(name =>
+		knownCalendars.some(c => c.name === name && c.writable));
+	if (1 === shown.length) return shown[0];
+	const fallback = knownCalendars.find(c => c.isDefault && c.writable);
+	return fallback ? fallback.name : '';
+}
+
+function loadCalendars(list) {
+	knownCalendars = (list || []).filter(c => c && c.name);
+	// A calendar that has gone away should not go on being asked for.
+	const alive = shownCalendars().filter(n => knownCalendars.some(c => c.name === n));
+	if (alive.length !== shownCalendars().length) setShownCalendars(alive);
+	renderCalendarList();
+}
+
+function renderCalendarList() {
+	const box = document.getElementById('calendar-list');
+	if (!box) return;
+	const shown = shownCalendars();
+	const showing = (name) => shown.length ? -1 !== shown.indexOf(name)
+		: !!(knownCalendars.find(c => c.name === name) || {}).isDefault;
+
+	box.textContent = '';
+	knownCalendars.forEach(cal => {
+		const row = document.createElement('label');
+		row.className = 'calendar-row';
+
+		const tick = document.createElement('input');
+		tick.type = 'checkbox';
+		tick.checked = showing(cal.name);
+		tick.addEventListener('change', () => {
+			const next = knownCalendars.filter(c =>
+				c.name === cal.name ? tick.checked : showing(c.name)).map(c => c.name);
+			setShownCalendars(next);
+			if (calendar) calendar.refetchEvents();
+		});
+
+		const swatch = document.createElement('span');
+		swatch.className = 'calendar-swatch';
+		swatch.style.background = cal.color || 'var(--cal-event-bg)';
+
+		const name = document.createElement('span');
+		name.className = 'calendar-name';
+		name.textContent = cal.displayName || cal.name;
+		name.title = (cal.components || []).join(', ') + (cal.writable ? '' : ' - read only');
+
+		row.appendChild(tick);
+		row.appendChild(swatch);
+		row.appendChild(name);
+
+		if (!cal.isDefault && cal.writable) {
+			const drop = document.createElement('button');
+			drop.type = 'button';
+			drop.className = 'calendar-drop';
+			drop.textContent = '×';
+			drop.title = 'Delete this calendar and everything in it';
+			drop.setAttribute('aria-label', 'Delete ' + (cal.displayName || cal.name));
+			drop.addEventListener('click', (e) => {
+				e.preventDefault();
+				removeCalendar(cal);
+			});
+			row.appendChild(drop);
+		}
+		box.appendChild(row);
+	});
+}
+
+function addCalendar() {
+	const title = (document.getElementById('calendar-new-name') || {}).value || '';
+	if (!title.trim() || !rl.pluginRemoteRequest) return;
+	const colour = (document.getElementById('calendar-new-color') || {}).value || '';
+	const components = Array.from(document.querySelectorAll('.calendar-new-comp:checked'))
+		.map(box => box.value);
+
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Could not make that calendar.');
+			return;
+		}
+		// Made and showing: a calendar nobody can see is not obviously there.
+		setShownCalendars(shownCalendars().concat([res.name]));
+		document.getElementById('calendar-new-name').value = '';
+		if (calendar) calendar.refetchEvents();
+	}, 'CreateCalendar', {
+		DisplayName: title.trim(),
+		Color: colour,
+		Components: (components.length ? components : ['VEVENT']).join(',')
+	});
+}
+
+function removeCalendar(cal) {
+	if (!rl.pluginRemoteRequest) return;
+	if (!confirm('Delete "' + (cal.displayName || cal.name)
+		+ '" and everything in it? This cannot be undone.')) {
+		return;
+	}
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Could not delete that calendar.');
+			return;
+		}
+		setShownCalendars(shownCalendars().filter(n => n !== cal.name));
+		if (calendar) calendar.refetchEvents();
+	}, 'DeleteCalendar', { Name: cal.name });
 }
 
 /* ------------------------------------------------------------------ *
@@ -1782,11 +1965,16 @@ return;
 			start: new Date(event.dtstart || event.start),
 			end: new Date(event.dtend || event.end),
 			allDay: event.allDay || false,
-			backgroundColor: 'var(--cal-event-bg)',
-			borderColor: 'var(--cal-event-border)',
-			textColor: 'var(--cal-event-text)',
+			// A calendar given a colour is drawn in it, so several of them at
+			// once can be told apart. One without keeps the theme's own.
+			backgroundColor: event.calendarColor || 'var(--cal-event-bg)',
+			borderColor: event.calendarColor || 'var(--cal-event-border)',
+			textColor: event.calendarColor ? '#fff' : 'var(--cal-event-text)',
 			// An invitation nobody has answered, and one that was turned down,
 			// should not look like an appointment that is going ahead.
+			// A calendar somebody shared read-only cannot be written back to,
+			// so it is not dragged either - the 403 would come later.
+			editable: !event.readOnly,
 			classNames: ['modern-event'].concat(
 				(false === event.isOrganizer && 'NEEDS-ACTION' === (event.partstat || '').toUpperCase())
 					? ['event-unanswered'] : [],
@@ -1809,10 +1997,20 @@ return;
 				description: event.description || '',
 				attendees: event.attendees || '',
 				organizer: event.organizer || '',
-				isOrganizer: false !== event.isOrganizer
+				isOrganizer: false !== event.isOrganizer,
+				// Which calendar it came out of. An edit has to go back to the
+				// same one; before there was more than one, this was implied.
+				calendar: event.calendar || '',
+				calendarName: event.calendarName || '',
+				readOnly: !!event.readOnly
 			}
 		};
 	});
+
+	// The calendars this account has, and which of them are showing. The list
+	// comes back with the events rather than in a request of its own: it
+	// changes far too rarely to be worth asking twice.
+	loadCalendars(result.calendars || []);
 
 	// Whether this deployment has a meeting server and a geocoder at all.
 	calFeatures = {
@@ -1825,7 +2023,7 @@ return;
 	scheduleReminders(result.events || []);
 
 	successCallback(events);
-}, 'GetCalendarEvents', {});
+}, 'GetCalendarEvents', { Collections: shownCalendars().join(',') });
 }
 
 /* ------------------------------------------------------------------ *
@@ -1944,6 +2142,8 @@ function createEvent(eventData) {
 		Reminder: eventData.reminder || 0,
 		// comma or semicolon separated; the calendar server mails the invitations
 		Attendees: eventData.attendees || '',
+		// which calendar to write it to, when more than one is showing
+		Collection: writeCalendar(),
 		// how it repeats; the server assembles the RRULE from these
 		...(eventData.repeat || {})
 	});
@@ -2019,6 +2219,8 @@ function updateEvent(event, repeat, scope, skipped) {
 		// is the override's identity.
 		RecurrenceId: event.extendedProps?.recurrenceId,
 		Scope: scope || 'series',
+		// The calendar it was drawn from, so the edit goes back there.
+		Collection: event.extendedProps?.calendar || '',
 		EventId: eventId,
 		Title: event.title,
 		Start: startFormatted,
@@ -2050,11 +2252,12 @@ function respondToEvent(event, partstat, scope) {
 		EventId: eventId,
 		Partstat: partstat,
 		Scope: scope || 'series',
+		Collection: event.extendedProps?.calendar || '',
 		RecurrenceId: event.extendedProps?.recurrenceId || ''
 	});
 }
 
-function deleteEvent(eventId, scope, recurrenceId) {
+function deleteEvent(eventId, scope, recurrenceId, collection) {
 
 	if (!rl.pluginRemoteRequest || !eventId) return;
 
@@ -2071,6 +2274,7 @@ function deleteEvent(eventId, scope, recurrenceId) {
 		if (calendar) calendar.refetchEvents();
 	}, 'DeleteCalendarEvent', {
 		EventId: eventId,
+		Collection: collection || '',
 		// Removing one occurrence rewrites the series with that date excluded,
 		// and removing this and all following ends the series just before it;
 		// only removing the series deletes the resource outright.

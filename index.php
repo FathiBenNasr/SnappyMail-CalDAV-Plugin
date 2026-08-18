@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.11',
+		VERSION  = '2.12',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -23,6 +23,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('DeleteCalendarEvent', 'DoDeleteCalendarEvent');
 		$this->addJsonHook('CancelCalendarEvent', 'DoCancelCalendarEvent');
 		$this->addJsonHook('RespondCalendarEvent', 'DoRespondCalendarEvent');
+		$this->addJsonHook('ListCalendars', 'DoListCalendars');
+		$this->addJsonHook('CreateCalendar', 'DoCreateCalendar');
+		$this->addJsonHook('DeleteCalendar', 'DoDeleteCalendar');
 		$this->addJsonHook('SuggestAttendees', 'DoSuggestAttendees');
 		$this->addJsonHook('NewConferenceUrl', 'DoNewConferenceUrl');
 		$this->addJsonHook('SearchPlaces', 'DoSearchPlaces');
@@ -1606,14 +1609,33 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	 * Returns null when the UID is not in the collection, or when the server
 	 * will not answer the query - callers decide what to do with that.
 	 */
-	private function resolveEventHref(array $aConfig, string $sPassword, string $sUid) : ?string
+	/**
+	 * The URL of one collection in this account's calendar home.
+	 *
+	 * The name may come from the browser, and it is pasted into a URL, so it is
+	 * held to a plain filename: anything with a slash, a dot pair or a colon in
+	 * it could walk out of the home and address some other part of the server.
+	 * An unusable name falls back to the configured collection rather than
+	 * being repaired into a different one.
+	 */
+	private function collectionUrl(array $aConfig, string $sCollection = '') : string
+	{
+		$sName = \trim($sCollection);
+		if (!\strlen($sName) || !\preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/', $sName)
+		 || false !== \strpos($sName, '..')) {
+			$sName = (string) ($aConfig['Collection'] ?? 'Default');
+		}
+		return \rtrim($aConfig['CalDAVUrl'], '/') . '/' . \rawurlencode($sName) . '/';
+	}
+
+	private function resolveEventHref(array $aConfig, string $sPassword, string $sUid,
+		string $sCollection = '') : ?string
 	{
 		if (!\strlen($sUid)) {
 			return null;
 		}
 
-		$sCollectionUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/'
-			. ($aConfig['Collection'] ?? 'Default') . '/';
+		$sCollectionUrl = $this->collectionUrl($aConfig, $sCollection);
 
 		$sBody = '<?xml version="1.0" encoding="utf-8" ?>' . "\n"
 			. '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
@@ -1632,8 +1654,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		}
 
 		try {
-			$oDoc = new \DOMDocument();
-			if (!$oDoc->loadXML((string) $aResult['body'])) {
+			$oDoc = $this->loadDavXml((string) $aResult['body']);
+			if (!$oDoc) {
 				return null;
 			}
 			$oXPath = new \DOMXPath($oDoc);
@@ -2025,10 +2047,28 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sPassword = (string)$sPassword;
 			}
 			
-			// Build CalDAV URL
-			$sCalDAVUrl = $aConfig['CalDAVUrl'] . '/' . ($aConfig['Collection'] ?? 'Default') . '/';
-			
-			
+			// Which calendars to draw. The home holds several; the browser says
+			// which of them are showing, and an empty answer means the one this
+			// account is configured for - which is all this ever used to read.
+			$aCalendars = $this->listCalendars($aConfig, $sPassword);
+			$aWanted = \preg_split('/[\s,;]+/', (string) $this->jsonParam('Collections', ''), -1, PREG_SPLIT_NO_EMPTY) ?: array();
+			$aShow = array();
+			foreach ($aCalendars as $aCalendar) {
+				if (!\in_array('VEVENT', $aCalendar['components'], true)) {
+					continue;
+				}
+				if ($aWanted ? \in_array($aCalendar['name'], $aWanted, true) : $aCalendar['isDefault']) {
+					$aShow[] = $aCalendar;
+				}
+			}
+			// A server that will not list its collections still has the one the
+			// URL names, and reading it is better than drawing nothing.
+			if (!$aShow) {
+				$aShow[] = array('name' => (string) ($aConfig['Collection'] ?? 'Default'),
+					'displayName' => (string) ($aConfig['Collection'] ?? 'Default'),
+					'color' => '', 'writable' => true);
+			}
+
 			// CalDAV REPORT query for events
 			$sReportBody = '<?xml version="1.0" encoding="utf-8" ?>' . "\n";
 			$sReportBody .= '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">' . "\n";
@@ -2043,28 +2083,39 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sReportBody .= '  </C:filter>' . "\n";
 			$sReportBody .= '</C:calendar-query>';
 			
-			$result = $this->makeCalDAVRequest(
-				$sCalDAVUrl,
-				'REPORT',
-				$aConfig['User'],
-				$sPassword,
-				$sReportBody,
-				[
-					'Content-Type: application/xml; charset=utf-8',
-					'Depth: 1'
-				]
-			);
-			
-			
 			$aEvents = [];
-			if ($result['code'] === 207) {
-				// Parse multistatus response
-				$aEvents = $this->parseCalDAVResponse($result['body'], $oAccount->Email());
-			} else {
+			foreach ($aShow as $aCalendar) {
+				$result = $this->makeCalDAVRequest(
+					$this->collectionUrl($aConfig, $aCalendar['name']),
+					'REPORT',
+					$aConfig['User'],
+					$sPassword,
+					$sReportBody,
+					[
+						'Content-Type: application/xml; charset=utf-8',
+						'Depth: 1'
+					]
+				);
+				if (207 !== (int) $result['code']) {
+					continue;
+				}
+				// Each event remembers which calendar it came out of: an edit
+				// has to go back to the same one, and the grid colours by it.
+				foreach ($this->parseCalDAVResponse($result['body'], $oAccount->Email()) as $aEvent) {
+					$aEvent['calendar'] = $aCalendar['name'];
+					$aEvent['calendarName'] = $aCalendar['displayName'];
+					$aEvent['calendarColor'] = $aCalendar['color'];
+					$aEvent['readOnly'] = empty($aCalendar['writable']);
+					$aEvents[] = $aEvent;
+				}
 			}
-			
+
 			return $this->jsonResponse(__FUNCTION__, [
 				'events' => $aEvents,
+				// The picker is filled from the same round trip that fills the
+				// grid: asking twice for something that changes this rarely is
+				// a request nobody needed.
+				'calendars' => $aCalendars,
 				// Whether the dialog should offer to mint a room, and to look a
 				// place up, at all.
 				'conferenceEnabled' => \strlen($this->conferenceBaseUrl()) > 0,
@@ -2231,8 +2282,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sICS .= "END:VEVENT\r\n";
 			$sICS .= "END:VCALENDAR\r\n";
 			
-			// PUT event to CalDAV server
-			$sEventUrl = $aConfig['CalDAVUrl'] . '/' . ($aConfig['Collection'] ?? 'Default') . '/' . $sUid . '.ics';
+			// PUT event to CalDAV server, into whichever calendar the dialog was
+			// writing to - which is the configured one until it says otherwise.
+			$sEventUrl = $this->collectionUrl($aConfig, (string) $this->jsonParam('Collection', ''))
+				. \rawurlencode($sUid) . '.ics';
 			
 			
 			$result = $this->makeCalDAVRequest(
@@ -2314,12 +2367,14 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			
 			// Ask the server where the event lives instead of assuming
 			// <UID>.ics, which only holds for events this plugin created.
-			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId);
+			// The calendar the grid drew this event from, so an edit goes back
+			// where it came from rather than to whichever one is configured.
+			$sCollection = (string) $this->jsonParam('Collection', '');
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId, $sCollection);
 			if (null === $sEventUrl) {
 				// The lookup may simply be unsupported, so still try the name we
 				// would have given it ourselves before giving up.
-				$sEventUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/'
-					. ($aConfig['Collection'] ?? 'Default') . '/' . \rawurlencode($sEventId) . '.ics';
+				$sEventUrl = $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sEventId) . '.ics';
 			}
 
 			// Edit the stored event rather than replacing it. Rebuilding the
@@ -2353,8 +2408,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// than leave the same occurrences standing in two places.
 			$sTailUrl = '';
 			if (\strlen((string) $sTailIcs) && \strlen((string) $sTailUid)) {
-				$sTailUrl = \rtrim($aConfig['CalDAVUrl'], '/') . '/'
-					. ($aConfig['Collection'] ?? 'Default') . '/' . \rawurlencode($sTailUid) . '.ics';
+				$sTailUrl = $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sTailUid) . '.ics';
 				$aTail = $this->makeCalDAVRequest($sTailUrl, 'PUT', $aConfig['User'], $sPassword,
 					$sTailIcs, ['Content-Type: text/calendar; charset=utf-8']);
 				if (!\in_array((int) $aTail['code'], array(200, 201, 204), true)) {
@@ -2387,6 +2441,289 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		}
 	}
 	
+	/**
+	 * The calendars in this account's home: one entry per collection, with what
+	 * it is called, what colour it was given and which components it may hold.
+	 *
+	 * A CalDAV home is not a single calendar. It has always had several - Cyrus
+	 * creates a default one plus the scheduling Inbox and Outbox - and this
+	 * plugin has only ever looked at whichever one the URL template happened to
+	 * name. Everything that is not a calendar is left out here: the Inbox and
+	 * Outbox carry their own resourcetype and hold no events to draw.
+	 */
+	private function listCalendars(array $aConfig, string $sPassword) : array
+	{
+		$sBody = '<?xml version="1.0" encoding="utf-8" ?>'
+			. '<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"'
+			. ' xmlns:CS="http://calendarserver.org/ns/" xmlns:IC="http://apple.com/ns/ical/">'
+			. '<D:prop>'
+			. '<D:resourcetype /><D:displayname /><D:current-user-privilege-set />'
+			. '<C:supported-calendar-component-set /><C:calendar-description />'
+			. '<IC:calendar-color /><CS:getctag />'
+			. '</D:prop></D:propfind>';
+
+		$aResult = $this->makeCalDAVRequest(\rtrim($aConfig['CalDAVUrl'], '/') . '/', 'PROPFIND',
+			$aConfig['User'], $sPassword, $sBody,
+			['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+		if (207 !== (int) $aResult['code']) {
+			return array();
+		}
+		return $this->parseCalendarList((string) $aResult['body'],
+			(string) ($aConfig['Collection'] ?? 'Default'));
+	}
+
+	/**
+	 * Parse a DAV response body without letting a malformed one reach the PHP
+	 * log. A server that answers with something other than XML is a condition
+	 * to handle, not a warning to print on every request it does it on.
+	 */
+	private function loadDavXml(string $sXml) : ?\DOMDocument
+	{
+		if (!\strlen(\trim($sXml))) {
+			return null;
+		}
+		$oDoc = new \DOMDocument();
+		$bWas = \libxml_use_internal_errors(true);
+		$bOk  = $oDoc->loadXML($sXml);
+		\libxml_clear_errors();
+		\libxml_use_internal_errors($bWas);
+		return $bOk ? $oDoc : null;
+	}
+
+	/**
+	 * The calendars in a PROPFIND multistatus, kept apart from the request that
+	 * fetched it so the shape a server actually returns can be tested.
+	 */
+	private function parseCalendarList(string $sXml, string $sDefault) : array
+	{
+		$aCalendars = array();
+		try {
+			$oDoc = $this->loadDavXml($sXml);
+			if (!$oDoc) {
+				return array();
+			}
+			$oXPath = new \DOMXPath($oDoc);
+			$oXPath->registerNamespace('D', 'DAV:');
+			$oXPath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');
+			$oXPath->registerNamespace('IC', 'http://apple.com/ns/ical/');
+			$oXPath->registerNamespace('CS', 'http://calendarserver.org/ns/');
+
+			foreach ($oXPath->query('//D:response') as $oResponse) {
+				// Only calendars. The home itself, the scheduling Inbox and
+				// Outbox and the attachments collection all answer this
+				// PROPFIND and none of them holds anything to draw.
+				if (!$oXPath->query('.//D:resourcetype/C:calendar', $oResponse)->length
+				 || $oXPath->query('.//D:resourcetype/C:schedule-inbox', $oResponse)->length
+				 || $oXPath->query('.//D:resourcetype/C:schedule-outbox', $oResponse)->length) {
+					continue;
+				}
+
+				$sHref = \trim((string) ($oXPath->query('./D:href', $oResponse)->item(0)->nodeValue ?? ''));
+				$sName = \rawurldecode(\basename(\rtrim($sHref, '/')));
+				if (!\strlen($sName)) {
+					continue;
+				}
+
+				$aComponents = array();
+				foreach ($oXPath->query('.//C:supported-calendar-component-set/C:comp', $oResponse) as $oComp) {
+					$sComp = \strtoupper(\trim((string) $oComp->getAttribute('name')));
+					if (\strlen($sComp)) {
+						$aComponents[] = $sComp;
+					}
+				}
+
+				// No write privilege means somebody shared this read-only, and
+				// offering to edit it would only produce a 403 later.
+				$bWritable = 0 < $oXPath->query('.//D:current-user-privilege-set/D:privilege/D:write', $oResponse)->length
+					|| 0 < $oXPath->query('.//D:current-user-privilege-set/D:privilege/D:all', $oResponse)->length
+					|| 0 === $oXPath->query('.//D:current-user-privilege-set', $oResponse)->length;
+
+				$sColour = \trim((string) ($oXPath->query('.//IC:calendar-color', $oResponse)->item(0)->nodeValue ?? ''));
+				$aCalendars[] = array(
+					'name'        => $sName,
+					'displayName' => \trim((string) ($oXPath->query('.//D:displayname', $oResponse)->item(0)->nodeValue ?? '')) ?: $sName,
+					'description' => \trim((string) ($oXPath->query('.//C:calendar-description', $oResponse)->item(0)->nodeValue ?? '')),
+					// Apple writes #RRGGBBAA; the alpha means nothing to CSS here.
+					'color'       => \preg_match('/^#[0-9A-Fa-f]{6}/', $sColour) ? \substr($sColour, 0, 7) : '',
+					'components'  => $aComponents ?: array('VEVENT'),
+					'writable'    => $bWritable,
+					'isDefault'   => 0 === \strcasecmp($sName, $sDefault),
+					'ctag'        => \trim((string) ($oXPath->query('.//CS:getctag', $oResponse)->item(0)->nodeValue ?? ''))
+				);
+			}
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'calendar list failed: ' . $oException->getMessage());
+			return array();
+		}
+
+		\usort($aCalendars, function ($a, $b) {
+			return ($b['isDefault'] <=> $a['isDefault'])
+				?: \strcasecmp($a['displayName'], $b['displayName']);
+		});
+		return $aCalendars;
+	}
+
+	/**
+	 * The account's calendars, for the picker.
+	 */
+	public function DoListCalendars() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'calendars' => [],
+					'error' => 'Calendar not configured']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'calendars' => [],
+					'error' => 'Cannot access encryption key']);
+			}
+			return $this->jsonResponse(__FUNCTION__, ['success' => true,
+				'calendars' => $this->listCalendars($aConfig, $sPassword)]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'calendars' => [],
+				'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
+	 * Make a calendar. Which components it may hold is settled here and cannot
+	 * be changed afterwards on most servers, which is why it is asked for up
+	 * front rather than assumed to be events.
+	 */
+	public function DoCreateCalendar() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+
+			$sTitle = \trim((string) $this->jsonParam('DisplayName', ''));
+			if (!\strlen($sTitle)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'A name is required']);
+			}
+			$sTitle = \mb_substr($sTitle, 0, 100);
+
+			// Only the three component types a calendar can actually be made
+			// for. VFREEBUSY and VALARM are not collections, and VAVAILABILITY
+			// is a property of the scheduling inbox rather than a calendar of
+			// its own.
+			$aWanted = array();
+			foreach (\preg_split('/[\s,;]+/', (string) $this->jsonParam('Components', 'VEVENT'), -1, PREG_SPLIT_NO_EMPTY) as $sComp) {
+				$sComp = \strtoupper($sComp);
+				if (\in_array($sComp, array('VEVENT', 'VTODO', 'VJOURNAL'), true)) {
+					$aWanted[$sComp] = $sComp;
+				}
+			}
+			$aWanted = $aWanted ?: array('VEVENT' => 'VEVENT');
+
+			$sColour = \trim((string) $this->jsonParam('Color', ''));
+			$sColour = \preg_match('/^#[0-9A-Fa-f]{6}$/', $sColour) ? $sColour : '';
+
+			// The URL segment is derived from the name but is not the name: it
+			// has to survive being a path, and two calendars may be called the
+			// same thing.
+			$sSlug = \strtolower(\preg_replace('/[^A-Za-z0-9]+/', '-', $sTitle));
+			$sSlug = \trim(\preg_replace('/-+/', '-', $sSlug), '-');
+			$sSlug = \substr($sSlug, 0, 40);
+			$sName = (\strlen($sSlug) ? $sSlug : 'calendar') . '-' . \bin2hex(\random_bytes(3));
+
+			$sXml = '<?xml version="1.0" encoding="utf-8" ?>'
+				. '<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"'
+				. ' xmlns:IC="http://apple.com/ns/ical/"><D:set><D:prop>'
+				. '<D:displayname>' . \htmlspecialchars($sTitle, ENT_XML1 | ENT_QUOTES, 'UTF-8') . '</D:displayname>';
+			if (\strlen($sColour)) {
+				$sXml .= '<IC:calendar-color>' . $sColour . '</IC:calendar-color>';
+			}
+			$sXml .= '<C:supported-calendar-component-set>';
+			foreach ($aWanted as $sComp) {
+				$sXml .= '<C:comp name="' . $sComp . '" />';
+			}
+			$sXml .= '</C:supported-calendar-component-set></D:prop></D:set></C:mkcalendar>';
+
+			$aResult = $this->makeCalDAVRequest($this->collectionUrl($aConfig, $sName), 'MKCALENDAR',
+				$aConfig['User'], $sPassword, $sXml,
+				['Content-Type: application/xml; charset=utf-8']);
+
+			return $this->jsonResponse(__FUNCTION__,
+				\in_array((int) $aResult['code'], array(200, 201, 204), true)
+					? ['success' => true, 'name' => $sName, 'displayName' => $sTitle,
+						'color' => $sColour, 'components' => \array_values($aWanted)]
+					: ['success' => false, 'error' => 'CalDAV error: ' . $aResult['code']]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
+	 * Remove a calendar, with everything in it. The configured one is refused:
+	 * it is where this plugin writes by default, and deleting it would leave
+	 * the account pointing at a collection that is not there.
+	 */
+	public function DoDeleteCalendar() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+			$sName = \trim((string) $this->jsonParam('Name', ''));
+			if (!\strlen($sName)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Which calendar?']);
+			}
+			if (0 === \strcasecmp($sName, (string) ($aConfig['Collection'] ?? 'Default'))) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false,
+					'error' => 'This is the calendar new events are written to, so it cannot be removed here.']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+
+			$sUrl = $this->collectionUrl($aConfig, $sName);
+			// collectionUrl() falls back to the default for a name it will not
+			// have, and deleting that by accident is exactly what must not
+			// happen here.
+			if ($sUrl === $this->collectionUrl($aConfig)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Unusable calendar name']);
+			}
+
+			$aResult = $this->makeCalDAVRequest($sUrl, 'DELETE', $aConfig['User'], $sPassword);
+			return $this->jsonResponse(__FUNCTION__,
+				\in_array((int) $aResult['code'], array(200, 202, 204), true)
+					? ['success' => true]
+					: ['success' => false, 'error' => 'CalDAV error: ' . $aResult['code']]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
+	 * The stored CalDAV password, decrypted with the main account's key.
+	 * Six actions had their own copy of this before there were six.
+	 */
+	private function calendarPassword(array $aConfig) : ?string
+	{
+		$oMainAccount = $this->Manager()->Actions()->GetMainAccountFromToken();
+		if (!$oMainAccount || !\method_exists($oMainAccount, 'CryptKey')) {
+			return null;
+		}
+		$mPassword = \SnappyMail\Crypt::DecryptFromJSON($aConfig['Password'], $oMainAccount->CryptKey());
+		if (\is_object($mPassword) && \method_exists($mPassword, '__toString')) {
+			$mPassword = (string) $mPassword;
+		}
+		return \is_string($mPassword) ? $mPassword : null;
+	}
+
 	/**
 	 * Answer an invitation: going, not going, or maybe.
 	 *
@@ -2431,9 +2768,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sPassword = (string) $sPassword;
 			}
 
-			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId)
-				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
-					. '/' . \rawurlencode($sEventId) . '.ics';
+			$sCollection = (string) $this->jsonParam('Collection', '');
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId, $sCollection)
+				?: $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sEventId) . '.ics';
 
 			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
 			$sICS = (200 === (int) $aFetch['code'] && \strlen((string) $aFetch['body']))
@@ -2503,9 +2840,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$sPassword = (string) $sPassword;
 			}
 
-			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId)
-				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
-					. '/' . \rawurlencode($sEventId) . '.ics';
+			$sCollection = (string) $this->jsonParam('Collection', '');
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId, $sCollection)
+				?: $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sEventId) . '.ics';
 
 			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
 			if (200 !== (int) $aFetch['code'] || !\strlen((string) $aFetch['body'])) {
@@ -2616,9 +2953,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// holds this UID. <UID>.ics is only where *this* plugin puts them,
 			// so it stays as the fallback for a server that will not answer the
 			// lookup - and the URL-encoding there handles @ in the UID.
-			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId)
-				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
-					. '/' . \rawurlencode($sEventId) . '.ics';
+			$sCollection = (string) $this->jsonParam('Collection', '');
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId, $sCollection)
+				?: $this->collectionUrl($aConfig, $sCollection) . \rawurlencode($sEventId) . '.ics';
 
 			// Removing one occurrence of a series means editing the object, not
 			// deleting it: the whole series lives in this one resource, so a
@@ -2690,9 +3027,11 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$events = [];
 		
 		try {
-			$doc = new \DOMDocument();
-			$doc->loadXML($xml);
-			
+			$doc = $this->loadDavXml((string) $xml);
+			if (!$doc) {
+				return $events;
+			}
+
 			$xpath = new \DOMXPath($doc);
 			$xpath->registerNamespace('D', 'DAV:');
 			$xpath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');

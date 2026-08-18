@@ -145,6 +145,41 @@ Delete is not a way to call a meeting off quietly — the difference is that
 Cancel states what was cancelled, and Delete leaves the guest's client to infer
 it.
 
+## More than one calendar
+
+A CalDAV home has always held several collections — a default calendar, the
+scheduling Inbox and Outbox, and whatever else the user or another client made.
+This plugin read only the one its URL template named. The **📚 Calendars** panel
+now lists them, remembers which are showing, colours the grid by the calendar
+each event came out of, and makes new ones.
+
+* **Showing and hiding** is kept in the browser, not on the server: it is a view
+  preference rather than a property of the calendar, and the same account read
+  from a phone may reasonably want a different answer.
+* **Making one** issues `MKCALENDAR` with a display name, a colour, and the
+  components it may hold — events, tasks or notes (`VEVENT`, `VTODO`,
+  `VJOURNAL`). Most servers fix that set at creation, which is why it is asked
+  for up front rather than assumed. The URL segment is derived from the name
+  but is not the name: it has to survive being a path, and two calendars may
+  well be called the same thing.
+* **Deleting one** removes it and everything in it, and refuses on the calendar
+  this account is configured to write to — deleting that would leave the plugin
+  pointing at a collection that is not there.
+* **Read-only calendars**, shared by somebody else, are drawn but not draggable.
+  Offering to edit them would only produce a 403 later.
+* Every write says which calendar it means, so an event edited from a grid
+  showing four of them goes back to the one it came from.
+
+A collection name reaching the server from the browser is held to a plain
+filename — letters, digits, dot, dash, underscore, and not starting with a dot
+or a dash. It is pasted into a URL, and a name with a slash or a dot pair in it
+could address something outside the calendar home entirely. A name that fails
+falls back to the configured calendar rather than being repaired into a
+different one.
+
+The scheduling Inbox and Outbox carry the `calendar` resourcetype too, and are
+deliberately left out: drawing them would show every invitation twice.
+
 ## Repeating events
 
 The **Repeats** row builds the rule out of named fields — frequency, interval,
