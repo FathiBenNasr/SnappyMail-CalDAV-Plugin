@@ -47,10 +47,11 @@ events bypass expansion so historic events are not truncated.
 
 **Recurring events can be created.** Expanding a series was only half of it:
 the dialog had no way to make one, so anything repeating had to be created in
-another client. It now has a **Repeats** row — daily, weekly, monthly or yearly,
-every *n* of those, on chosen weekdays when weekly, ending never, after *n*
-times, or on a date — which the server assembles into an `RRULE`. See
-**Repeating events** below for what it does with the ones it cannot express.
+another client. It now has a **Repeats** row offering the same presets
+Thunderbird does — daily, weekly, every weekday, bi-weekly, monthly, yearly —
+plus **Custom**, which opens interval, weekday and ending fields. The server
+assembles the `RRULE` from those. A single occurrence can also be moved or
+removed without disturbing the rest. See **Repeating events** below.
 
 **Reminders work.** `VALARM` was ignored entirely, and the reminder control in
 the event dialog only appended a marker string to the description — it alerted
@@ -122,20 +123,30 @@ never accepts a rule as a string: an `RRULE` is written straight into the
 iCalendar body, so taking one from the browser would hand it a line to write
 whatever it liked on. Every value is a fixed keyword or a bounded integer.
 
-The whole series lives in one event, which has consequences worth stating:
+### This occurrence, or the whole series
 
-* Editing a repeating event edits **every** occurrence, and Delete removes the
-  whole series — the button says so when it will. Editing or deleting a single
-  occurrence needs `RECURRENCE-ID` overrides and `EXDATE`, which this dialog
-  does not do yet; another client can still do it, and what it writes is left
-  alone.
-* Dragging or resizing one occurrence in the grid **moves the series** by that
-  much, rather than dropping it on that one date — the shift is applied to the
-  master event. Without this, dragging next week's stand-up would have moved the
-  entire series onto next week.
-* An event another client wrote in its own timezone keeps its `TZID` through
-  such an edit. Retyping it as UTC would freeze it against the next
-  daylight-saving change.
+Opening one occurrence of a repeating event shows a **Save changes to** row —
+this occurrence, or the whole series — and dragging, resizing or deleting one
+asks the same question outright before anything is written. The two are not
+close enough to guess between: one cancelled stand-up and a cancelled stand-up
+are different sentences. The row starts on the whole series, which is what the
+dialog did before this existed.
+
+* **This occurrence** writes a `RECURRENCE-ID` override — a second `VEVENT` in
+  the same resource carrying the changed time or title and no `RRULE` — which
+  is exactly what every other CalDAV client reads as "this one is different".
+  Deleting one adds an `EXDATE` for that date instead of removing the resource,
+  and drops any override that was standing on it.
+* **The whole series** edits the master event, so the change reaches every
+  occurrence. Dragging or resizing under this scope **shifts the series** by the
+  delta rather than dropping it on the date you dragged to; without that,
+  dragging next week's stand-up would have moved the entire series onto next
+  week. Overrides another client wrote are left where they are.
+
+An event another client wrote in its own timezone keeps its `TZID` through
+either kind of edit, and an all-day series gets a `DATE`-valued
+`RECURRENCE-ID`. Retyping either as UTC would freeze it against the next
+daylight-saving change.
 
 Some rules are more than these controls can show — "the second Monday of the
 month", "the last weekday", anything with `BYSETPOS` or `BYMONTHDAY`. Those are

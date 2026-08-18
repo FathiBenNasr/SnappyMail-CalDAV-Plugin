@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.6',
+		VERSION  = '2.7',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -127,16 +127,30 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				return null;
 			}
 
-			// With a recurring event, edit the master - the occurrence overrides
-			// carry RECURRENCE-ID and must keep their own times.
-			$oEvent = null;
+			// The master is the VEVENT without a RECURRENCE-ID; the others are
+			// overrides, each replacing one occurrence of it.
+			$oMaster = null;
 			foreach ($oVCal->VEVENT as $oCandidate) {
-				if (!isset($oCandidate->RECURRENCE_ID)) {
-					$oEvent = $oCandidate;
+				if (!isset($oCandidate->{'RECURRENCE-ID'})) {
+					$oMaster = $oCandidate;
 					break;
 				}
 			}
-			$oEvent = $oEvent ?: $oVCal->VEVENT;
+			$oMaster = $oMaster ?: $oVCal->VEVENT;
+			$oEvent = $oMaster;
+
+			// "This occurrence" edits the override for that one date, splitting
+			// a fresh one off the series if there is not one yet. "The series"
+			// - the default, and all there used to be - edits the master.
+			$sRecurrenceId = \trim((string) $this->jsonParam('RecurrenceId', ''));
+			$bOccurrence = 'occurrence' === \strtolower((string) $this->jsonParam('Scope', 'series'))
+				&& \strlen($sRecurrenceId) && isset($oMaster->RRULE);
+			if ($bOccurrence) {
+				$oEvent = $this->occurrenceOverride($oVCal, $oMaster, $sRecurrenceId);
+				if (null === $oEvent) {
+					return null;
+				}
+			}
 
 			$sOldStart = (string) ($oEvent->DTSTART ?? '');
 			$sOldEnd   = (string) ($oEvent->DTEND ?? '');
@@ -155,9 +169,11 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// The times are edited in place rather than replaced, so a series
 			// another client wrote in its own timezone keeps its TZID - retyping
 			// it as UTC would freeze it against the next daylight-saving change.
-			$sRecurrenceId = \trim((string) $this->jsonParam('RecurrenceId', ''));
+			//
+			// None of this applies to an override: it stands for one date and
+			// takes the times it is given.
 			$bShifted = false;
-			if (\strlen($sRecurrenceId) && isset($oEvent->RRULE) && isset($oEvent->DTSTART)) {
+			if (!$bOccurrence && \strlen($sRecurrenceId) && isset($oEvent->RRULE) && isset($oEvent->DTSTART)) {
 				try {
 					$oUtc    = new \DateTimeZone('UTC');
 					$iWas    = (new \DateTime($sRecurrenceId, $oUtc))->getTimestamp();
@@ -193,7 +209,9 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// How it repeats, under the same rule as the fields below: only
 			// rewritten when the dialog actually sent it, so dragging an
 			// occurrence in the grid cannot quietly flatten the series.
-			$mRepeat = $this->jsonParam('Repeat', null);
+			// An override stands for a single date and cannot carry the series
+			// rule, so the dialog's repeat fields are ignored on that path.
+			$mRepeat = $bOccurrence ? null : $this->jsonParam('Repeat', null);
 			if (null !== $mRepeat) {
 				$sRRule = $this->buildRecurrenceRule((bool) $bAllDay);
 				$oEvent->remove('RRULE');
@@ -303,6 +321,117 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			return $oVCal->serialize();
 		} catch (\Throwable $oException) {
 			\SnappyMail\Log::notice('CalDAV', 'update parse failed: ' . $oException->getMessage());
+			return null;
+		}
+	}
+
+	/**
+	 * The VEVENT standing for one occurrence of a series, created if need be.
+	 *
+	 * A series is one iCalendar object: a master carrying the RRULE, plus an
+	 * override VEVENT per occurrence that differs from it, each tied to the
+	 * occurrence it replaces by RECURRENCE-ID. A new override starts as a copy
+	 * of the master so it keeps everything the occurrence already had -
+	 * organiser, guests, alarms, description - minus the recurrence itself,
+	 * which belongs to the series and not to one date of it.
+	 *
+	 * @return \Sabre\VObject\Component\VEvent|null
+	 */
+	private function occurrenceOverride(\Sabre\VObject\Component\VCalendar $oVCal,
+		$oMaster, string $sRecurrenceId)
+	{
+		try {
+			$iWhen = (new \DateTime($sRecurrenceId, new \DateTimeZone('UTC')))->getTimestamp();
+		} catch (\Throwable $oException) {
+			return null;
+		}
+
+		foreach ($oVCal->VEVENT as $oCandidate) {
+			if (isset($oCandidate->{'RECURRENCE-ID'})
+			 && $oCandidate->{'RECURRENCE-ID'}->getDateTime()->getTimestamp() === $iWhen) {
+				return $oCandidate;
+			}
+		}
+
+		if (!isset($oMaster->DTSTART)) {
+			return null;
+		}
+		$oNew = clone $oMaster;
+		foreach (array('RRULE', 'RDATE', 'EXDATE', 'RECURRENCE-ID') as $sProperty) {
+			$oNew->remove($sProperty);
+		}
+
+		// The id has to be written the way the master writes DTSTART - same
+		// value type, same zone - or the server cannot tell which occurrence
+		// this replaces, and stores it as an unrelated second event.
+		$bTimed = $oMaster->DTSTART->hasTime();
+		$oZone  = $oMaster->DTSTART->getDateTime()->getTimezone() ?: new \DateTimeZone('UTC');
+		$oId    = $oNew->add('RECURRENCE-ID', '19700101', $bTimed ? array() : array('VALUE' => 'DATE'));
+		$oId->setDateTime((new \DateTime('@' . $iWhen))->setTimezone($oZone));
+
+		$oVCal->add($oNew);
+		return $oNew;
+	}
+
+	/**
+	 * Drop one occurrence out of a series by adding it to EXDATE, and remove
+	 * any override that stood for it. Returns the rewritten object, or null if
+	 * this is not a series to take a date out of.
+	 *
+	 * Deleting an occurrence is not deleting a resource: the series lives in a
+	 * single iCalendar object, so what goes to the server is a PUT of the
+	 * object with that date excluded, never a DELETE.
+	 */
+	private function excludeOccurrence(string $sExisting, string $sRecurrenceId) : ?string
+	{
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sExisting, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VEVENT)) {
+				return null;
+			}
+
+			$oMaster = null;
+			foreach ($oVCal->VEVENT as $oCandidate) {
+				if (!isset($oCandidate->{'RECURRENCE-ID'})) {
+					$oMaster = $oCandidate;
+					break;
+				}
+			}
+			if (!$oMaster || !isset($oMaster->RRULE) || !isset($oMaster->DTSTART)) {
+				return null;
+			}
+
+			$iWhen = (new \DateTime($sRecurrenceId, new \DateTimeZone('UTC')))->getTimestamp();
+			$bTimed = $oMaster->DTSTART->hasTime();
+			$oZone  = $oMaster->DTSTART->getDateTime()->getTimezone() ?: new \DateTimeZone('UTC');
+
+			// An override for this date is now moot: the date is gone.
+			foreach ($oVCal->VEVENT as $oCandidate) {
+				if (isset($oCandidate->{'RECURRENCE-ID'})
+				 && $oCandidate->{'RECURRENCE-ID'}->getDateTime()->getTimestamp() === $iWhen) {
+					$oVCal->remove($oCandidate);
+				}
+			}
+
+			// Already excluded - by another client, or by a second click.
+			foreach ($oMaster->select('EXDATE') as $oExdate) {
+				foreach ($oExdate->getDateTimes() as $oExisting) {
+					if ($oExisting->getTimestamp() === $iWhen) {
+						return $oVCal->serialize();
+					}
+				}
+			}
+
+			$oExdate = $oMaster->add('EXDATE', '19700101', $bTimed ? array() : array('VALUE' => 'DATE'));
+			$oExdate->setDateTimes(array((new \DateTime('@' . $iWhen))->setTimezone($oZone)));
+
+			// The guests' clients need to be told an occurrence went away.
+			$oMaster->SEQUENCE = ((int) ((string) ($oMaster->SEQUENCE ?? '0'))) + 1;
+			$oMaster->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+
+			return $oVCal->serialize();
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'exclude failed: ' . $oException->getMessage());
 			return null;
 		}
 	}
@@ -1222,7 +1351,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			foreach ($oVCal->VEVENT as $oEvent) {
 				if (isset($oEvent->RRULE) || isset($oEvent->RDATE)) {
 					$bRecurring = true;
-					if (isset($oEvent->RRULE) && !isset($oEvent->RECURRENCE_ID)) {
+					if (isset($oEvent->RRULE) && !isset($oEvent->{'RECURRENCE-ID'})) {
 						$aRules[(string) ($oEvent->UID ?? '')] = (string) $oEvent->RRULE;
 					}
 				}
@@ -1272,10 +1401,21 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					$sLocation = '';
 				}
 
+				// Which occurrence of the series this is. expand() puts a
+				// RECURRENCE-ID on every instance, and keeps the original one
+				// on an occurrence that was moved - so this stays the date the
+				// series says it is, not the date it was dragged to, which is
+				// what an edit or an exclusion has to name.
+				$sRecurrenceId = '';
+				if (isset($oEvent->{'RECURRENCE-ID'})) {
+					$sRecurrenceId = $oEvent->{'RECURRENCE-ID'}->getDateTime()->format($sFmt);
+				}
+
 				$sUid = (string) ($oEvent->UID ?? '');
 				$aResult[] = [
 					'uid'         => $sUid,
 					'rrule'       => $aRules[$sUid] ?? '',
+					'recurrenceId' => $sRecurrenceId,
 					'summary'     => (string) ($oEvent->SUMMARY ?? 'Untitled'),
 					'dtstart'     => $oDtStart->getDateTime()->format($sFmt),
 					'dtend'       => $oEndDt->format($sFmt),
@@ -1905,6 +2045,30 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
 					. '/' . \rawurlencode($sEventId) . '.ics';
 
+			// Removing one occurrence of a series means editing the object, not
+			// deleting it: the whole series lives in this one resource, so a
+			// DELETE here would take every other occurrence with it.
+			$sRecurrenceId = \trim((string) $this->jsonParam('RecurrenceId', ''));
+			if ('occurrence' === \strtolower((string) $this->jsonParam('Scope', 'series'))
+			 && \strlen($sRecurrenceId)) {
+				$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
+				$sICS = (200 === (int) $aFetch['code'] && \strlen((string) $aFetch['body']))
+					? $this->excludeOccurrence((string) $aFetch['body'], $sRecurrenceId)
+					: null;
+				if (null === $sICS) {
+					// Falling back to a whole-resource DELETE here would answer
+					// "remove one day" by removing the lot.
+					return $this->jsonResponse(__FUNCTION__, ['success' => false,
+						'error' => 'Could not read this series from the server, so nothing was removed.']);
+				}
+
+				$result = $this->makeCalDAVRequest($sEventUrl, 'PUT', $aConfig['User'], $sPassword,
+					$sICS, ['Content-Type: text/calendar; charset=utf-8']);
+				return $this->jsonResponse(__FUNCTION__,
+					(201 === $result['code'] || 204 === $result['code'] || 200 === $result['code'])
+						? ['success' => true]
+						: ['success' => false, 'error' => 'CalDAV error: ' . $result['code']]);
+			}
 
 			$result = $this->makeCalDAVRequest(
 				$sEventUrl,
@@ -1912,8 +2076,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$aConfig['User'],
 				$sPassword
 			);
-			
-			
+
+
 			if ($result['code'] === 204 || $result['code'] === 200) {
 				return $this->jsonResponse(__FUNCTION__, ['success' => true]);
 			} else {

@@ -181,6 +181,10 @@ cal.innerHTML = `
 .event-repeat-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
 .event-repeat-row:last-of-type { margin-bottom: 0; }
 .event-repeat-num { width: 5em; flex: 0 0 auto; }
+.event-repeat-unit { width: auto; flex: 0 0 auto; }
+.event-form-select:disabled, .event-form-input:disabled { opacity: .5; cursor: not-allowed; }
+.event-repeat-days label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+.event-modal-narrow { max-width: 460px; }
 .event-repeat-end { width: auto; flex: 0 0 auto; }
 .event-repeat-until { width: auto; flex: 0 0 auto; }
 .event-repeat-days { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -249,16 +253,32 @@ cal.innerHTML = `
 						<option value="">Does not repeat</option>
 						<option value="DAILY">Daily</option>
 						<option value="WEEKLY">Weekly</option>
+						<option value="WEEKDAYS">Every weekday</option>
+						<option value="BIWEEKLY">Bi-weekly</option>
 						<option value="MONTHLY">Monthly</option>
 						<option value="YEARLY">Yearly</option>
+						<option value="CUSTOM">Custom…</option>
 					</select>
 				</div>
+				<div class="event-form-group" id="event-scope-row" style="display:none;">
+					<label class="event-form-label" for="event-scope">Save changes to</label>
+					<select class="event-form-select" id="event-scope">
+						<option value="occurrence">This occurrence only</option>
+						<option value="series">The whole series</option>
+					</select>
+					<small class="event-field-hint" id="event-scope-hint"></small>
+				</div>
 				<div class="event-form-group event-repeat-detail" id="event-repeat-detail" style="display:none;">
-					<div class="event-repeat-row">
+					<div class="event-repeat-row" id="event-repeat-every" style="display:none;">
 						<span>Every</span>
 						<input type="number" class="event-form-input event-repeat-num" id="event-repeat-interval"
 							min="1" max="365" value="1" aria-label="Repeat every">
-						<span id="event-repeat-unit">weeks</span>
+						<select class="event-form-select event-repeat-unit" id="event-repeat-unit" aria-label="Repeat unit">
+							<option value="DAILY">days</option>
+							<option value="WEEKLY" selected>weeks</option>
+							<option value="MONTHLY">months</option>
+							<option value="YEARLY">years</option>
+						</select>
 					</div>
 					<div class="event-repeat-days" id="event-repeat-days" style="display:none;">
 						<label><input type="checkbox" value="MO"><span>Mon</span></label>
@@ -337,6 +357,22 @@ cal.innerHTML = `
 			<button class="event-modal-btn event-modal-btn-warning" id="event-cancel-meeting-btn" style="display:none;" title="Tell the guests it is off, then remove it">Cancel meeting</button>
 			<button class="event-modal-btn event-modal-btn-secondary">Cancel</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="event-save-btn">Save Event</button>
+		</div>
+	</div>
+</div>
+
+<div class="event-modal-overlay" id="scope-modal">
+	<div class="event-modal event-modal-narrow">
+		<div class="event-modal-header">
+			<h3 class="event-modal-title" id="scope-modal-title">Repeating event</h3>
+		</div>
+		<div class="event-modal-body">
+			<p id="scope-modal-intro"></p>
+		</div>
+		<div class="event-modal-footer">
+			<button class="event-modal-btn event-modal-btn-secondary" id="scope-modal-cancel">Cancel</button>
+			<button class="event-modal-btn event-modal-btn-primary" id="scope-modal-occurrence">This occurrence</button>
+			<button class="event-modal-btn event-modal-btn-primary" id="scope-modal-series">The whole series</button>
 		</div>
 	</div>
 </div>
@@ -465,7 +501,7 @@ cal.innerHTML = `
 
 		// Repeat controls: every one of them changes what the rule will say,
 		// so every one of them redraws the rest of the row and the summary.
-		['', 'interval', 'end', 'count', 'until'].forEach(id => {
+		['', 'unit', 'interval', 'end', 'count', 'until'].forEach(id => {
 			const el = repeatEl(id);
 			if (el) {
 				el.addEventListener('change', refreshRepeatUi);
@@ -473,6 +509,20 @@ cal.innerHTML = `
 			}
 		});
 		repeatDayBoxes().forEach(box => box.addEventListener('change', refreshRepeatUi));
+
+		// One occurrence or the series: in the dialog as a choice, and in the
+		// grid as a question asked when something is dragged or deleted.
+		const scopeSel = document.getElementById('event-scope');
+		if (scopeSel) scopeSel.addEventListener('change', refreshScopeUi);
+		const scopeButtons = {
+			'scope-modal-occurrence': 'occurrence',
+			'scope-modal-series': 'series',
+			'scope-modal-cancel': null
+		};
+		Object.keys(scopeButtons).forEach(id => {
+			const el = document.getElementById(id);
+			if (el) el.addEventListener('click', () => resolveScope(scopeButtons[id]));
+		});
 
 		// Modal close buttons (override inline onclick)
 		const closeBtn = document.querySelector('.event-modal-close');
@@ -579,8 +629,14 @@ function openEventModal(eventData = null, fcEvent = null) {
 		// How it repeats, read back from the master's rule. Weekly rules need
 		// the occurrence's own start to work out which weekdays those were.
 		loadRepeatFields(eventData.rrule || '', new Date(eventData.start), isAllDay);
-		const deleteLabel = (eventData.rrule || '').trim() ? 'Delete series' : 'Delete';
-		if (deleteBtn) deleteBtn.textContent = deleteLabel;
+
+		// One occurrence of a series, or all of them. Defaults to the one that
+		// was opened: that is what was clicked, and it is the smaller change.
+		const scopeRow = document.getElementById('event-scope-row');
+		const scopeSel = document.getElementById('event-scope');
+		if (scopeRow) scopeRow.style.display = isRecurring(eventData) ? 'block' : 'none';
+		if (scopeSel) scopeSel.value = 'occurrence';
+		refreshScopeUi();
 	} else {
 		// New event mode - default to timed event (not all-day) so time picker is visible
 		modalTitle.textContent = 'New Event';
@@ -591,6 +647,9 @@ function openEventModal(eventData = null, fcEvent = null) {
 		if (orgRowNew) orgRowNew.style.display = 'none';
 		document.getElementById('event-form').reset();
 		resetRepeatFields();
+		const scopeRowNew = document.getElementById('event-scope-row');
+		if (scopeRowNew) scopeRowNew.style.display = 'none';
+		refreshScopeUi();
 		currentEventGeo = '';
 		const now = new Date();
 		const end = new Date(now.getTime() + 3600000); // 1 hour later
@@ -727,7 +786,7 @@ function saveEventFromModal() {
 		currentEditingEvent.setExtendedProp('conference', eventData.conference || '');
 		currentEditingEvent.setExtendedProp('geo', eventData.geo || '');
 		currentEditingEvent.setExtendedProp('description', eventData.description || '');
-		updateEvent(currentEditingEvent, eventData.repeat);
+		updateEvent(currentEditingEvent, eventData.repeat, currentScope());
 	} else {
 		// Create new event
 		createEvent(eventData);
@@ -790,14 +849,26 @@ function sendCancellation() {
 
 function deleteEventFromModal() {
 	if (!currentEditingEvent) return;
-	
-	if (confirm(`Delete "${currentEditingEvent.title}"?`)) {
-		const eventId = currentEditingEvent.id || currentEditingEvent.extendedProps?.uid;
-		currentEditingEvent.remove();
-		deleteEvent(eventId);
+
+	const event = currentEditingEvent;
+	const remove = (scope) => {
+		const eventId = event.id || event.extendedProps?.uid;
+		event.remove();
+		deleteEvent(eventId, scope, event.extendedProps?.recurrenceId);
 		document.getElementById('event-modal').classList.remove('show');
 		currentEditingEvent = null;
+	};
+
+	// Deleting one occurrence of a series is not deleting the event; the two
+	// are far enough apart to be worth asking about rather than confirming.
+	if (isRecurring(event)) {
+		askRecurrenceScope('Delete repeating event',
+			'"' + event.title + '" repeats. Delete only this occurrence, or every occurrence?',
+			choice => { if (choice) remove(choice); });
+		return;
 	}
+
+	if (confirm(`Delete "${event.title}"?`)) remove('series');
 }
 
 /* ------------------------------------------------------------------ *
@@ -828,7 +899,20 @@ let currentEventGeo = '';
  * ------------------------------------------------------------------ */
 const DAY_TOKENS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 const REPEAT_UNITS = { DAILY: 'days', WEEKLY: 'weeks', MONTHLY: 'months', YEARLY: 'years' };
+const REPEAT_ADVERBS = { DAILY: 'daily', WEEKLY: 'weekly', MONTHLY: 'monthly', YEARLY: 'yearly' };
 const DAY_LABELS = { SU: 'Sun', MO: 'Mon', TU: 'Tue', WE: 'Wed', TH: 'Thu', FR: 'Fri', SA: 'Sat' };
+
+// The named choices in the dropdown, each a fixed rule. They are the same list
+// Thunderbird offers, so an event made in one reads back the same in the other.
+// Anything outside this list is Custom, which exposes the pieces directly.
+const REPEAT_PRESETS = {
+	DAILY:    { freq: 'DAILY',   interval: 1, days: [] },
+	WEEKLY:   { freq: 'WEEKLY',  interval: 1, days: [] },
+	WEEKDAYS: { freq: 'WEEKLY',  interval: 1, days: ['MO', 'TU', 'WE', 'TH', 'FR'] },
+	BIWEEKLY: { freq: 'WEEKLY',  interval: 2, days: [] },
+	MONTHLY:  { freq: 'MONTHLY', interval: 1, days: [] },
+	YEARLY:   { freq: 'YEARLY',  interval: 1, days: [] }
+};
 
 // True when the event carries a rule the dialog cannot show, so saving must
 // not touch it. See loadRepeatFields().
@@ -893,19 +977,56 @@ function parseRRule(rule) {
 	return out;
 }
 
+// What the controls currently describe, whichever way they were set: the
+// dropdown alone for a preset, the pieces below it for Custom.
+function repeatShape() {
+	const chosen = repeatEl('');
+	if (!chosen || !chosen.value) return null;
+	if ('CUSTOM' !== chosen.value) return REPEAT_PRESETS[chosen.value] || null;
+
+	const freq = repeatEl('unit').value;
+	return {
+		freq: freq,
+		interval: Math.max(1, parseInt(repeatEl('interval').value, 10) || 1),
+		days: 'WEEKLY' === freq ? repeatDayBoxes().filter(b => b.checked).map(b => b.value) : []
+	};
+}
+
+// Which entry in the dropdown says what a stored rule says. Custom is the
+// answer for anything the named ones do not cover exactly.
+function presetForRule(parsed, startDate, allDay) {
+	if (!parsed.freq) return '';
+
+	let days = shiftDayTokens(parsed.days, startDate, allDay, false);
+	// BYDAY naming only the day the event already starts on adds nothing - a
+	// weekly event repeats on its own weekday regardless - so it reads as a
+	// plain Weekly rather than pushing an otherwise ordinary rule into Custom.
+	if (1 === days.length && startDate && days[0] === DAY_TOKENS[startDate.getDay()]) {
+		days = [];
+	}
+
+	const same = (a, b) => a.length === b.length && a.every(x => -1 !== b.indexOf(x));
+	const found = Object.keys(REPEAT_PRESETS).find(key => {
+		const p = REPEAT_PRESETS[key];
+		return p.freq === parsed.freq && p.interval === parsed.interval && same(p.days, days);
+	});
+	return found || 'CUSTOM';
+}
+
 // Fill the repeat controls from a stored rule. `startDate` is the occurrence
 // the dialog was opened on, needed to read BYDAY back into local weekdays.
 function loadRepeatFields(rule, startDate, allDay) {
 	const parsed = parseRRule(rule);
-	const freq = repeatEl('');
-	if (!freq) return;
+	const chosen = repeatEl('');
+	if (!chosen) return;
 
 	// A rule this dialog cannot express is left alone rather than mangled: the
 	// select stays on "Does not repeat" and, because the Repeat field is then
 	// suppressed on save, the stored rule survives untouched.
 	unsupportedRepeat = !!(rule || '').trim() && !parsed.freq;
 
-	freq.value = parsed.freq;
+	chosen.value = presetForRule(parsed, startDate, allDay);
+	repeatEl('unit').value = parsed.freq || 'WEEKLY';
 	repeatEl('interval').value = parsed.interval;
 	repeatEl('end').value = parsed.end;
 	repeatEl('count').value = parsed.count;
@@ -917,9 +1038,10 @@ function loadRepeatFields(rule, startDate, allDay) {
 
 function resetRepeatFields() {
 	unsupportedRepeat = false;
-	const freq = repeatEl('');
-	if (!freq) return;
-	freq.value = '';
+	const chosen = repeatEl('');
+	if (!chosen) return;
+	chosen.value = '';
+	repeatEl('unit').value = 'WEEKLY';
 	repeatEl('interval').value = 1;
 	repeatEl('end').value = '';
 	repeatEl('count').value = 10;
@@ -929,16 +1051,18 @@ function resetRepeatFields() {
 }
 
 function refreshRepeatUi() {
-	const freq = repeatEl('');
-	if (!freq) return;
-	const detail = repeatEl('detail');
-	const on = !!freq.value;
+	const chosen = repeatEl('');
+	if (!chosen) return;
+	const on = !!chosen.value;
+	const custom = 'CUSTOM' === chosen.value;
 
+	const detail = repeatEl('detail');
 	if (detail) detail.style.display = on ? 'block' : 'none';
-	const unit = repeatEl('unit');
-	if (unit) unit.textContent = REPEAT_UNITS[freq.value] || '';
+	// The pieces are only worth showing when a preset is not already saying it.
+	const every = repeatEl('every');
+	if (every) every.style.display = custom ? 'flex' : 'none';
 	const days = repeatEl('days');
-	if (days) days.style.display = 'WEEKLY' === freq.value ? 'flex' : 'none';
+	if (days) days.style.display = (custom && 'WEEKLY' === repeatEl('unit').value) ? 'flex' : 'none';
 
 	const end = repeatEl('end').value;
 	repeatEl('count').style.display = 'count' === end ? 'inline-block' : 'none';
@@ -955,17 +1079,14 @@ function refreshRepeatUi() {
 // What the rule will actually do, in words, so nobody has to save it to find
 // out. Says nothing the fields do not already say - it just says it plainly.
 function describeRepeat() {
-	const freq = repeatEl('').value;
-	if (!freq) return '';
-	const every = Math.max(1, parseInt(repeatEl('interval').value, 10) || 1);
-	const unit = REPEAT_UNITS[freq] || '';
-	let text = 1 === every
-		? 'Repeats ' + { DAILY: 'daily', WEEKLY: 'weekly', MONTHLY: 'monthly', YEARLY: 'yearly' }[freq]
-		: 'Repeats every ' + every + ' ' + unit;
+	const shape = repeatShape();
+	if (!shape) return '';
+	let text = 1 === shape.interval
+		? 'Repeats ' + (REPEAT_ADVERBS[shape.freq] || '')
+		: 'Repeats every ' + shape.interval + ' ' + (REPEAT_UNITS[shape.freq] || '');
 
-	if ('WEEKLY' === freq) {
-		const picked = repeatDayBoxes().filter(b => b.checked).map(b => DAY_LABELS[b.value]);
-		if (picked.length) text += ' on ' + picked.join(', ');
+	if (shape.days.length) {
+		text += ' on ' + shape.days.map(d => DAY_LABELS[d]).join(', ');
 	}
 
 	const end = repeatEl('end').value;
@@ -975,24 +1096,93 @@ function describeRepeat() {
 	} else if ('until' === end && repeatEl('until').value) {
 		text += ', until ' + repeatEl('until').value;
 	}
-	return text + '. Editing or deleting it here affects the whole series.';
+	return text + '.';
 }
 
 // The repeat fields as the server wants them, or null when nothing about the
 // recurrence should be written - which is not the same as "does not repeat".
 function repeatPayload(startDate, allDay) {
-	if (unsupportedRepeat) return null;
-	const freq = repeatEl('');
-	if (!freq) return null;
-	const picked = repeatDayBoxes().filter(b => b.checked).map(b => b.value);
+	if (unsupportedRepeat || !repeatEl('')) return null;
+	const shape = repeatShape();
 	return {
-		Repeat: freq.value,
-		RepeatInterval: Math.max(1, parseInt(repeatEl('interval').value, 10) || 1),
-		RepeatDays: shiftDayTokens(picked, startDate, allDay, true).join(','),
+		Repeat: shape ? shape.freq : '',
+		RepeatInterval: shape ? shape.interval : 1,
+		RepeatDays: shape ? shiftDayTokens(shape.days, startDate, allDay, true).join(',') : '',
 		RepeatEnd: repeatEl('end').value,
 		RepeatCount: Math.max(1, parseInt(repeatEl('count').value, 10) || 1),
 		RepeatUntil: repeatEl('until').value
 	};
+}
+
+/* ------------------------------------------------------------------ *
+ * This occurrence, or the whole series
+ *
+ * A repeating event is one object on the server: a master carrying the rule,
+ * plus an override per occurrence that differs from it. So "change this one"
+ * and "change them all" are genuinely different writes, and which one was
+ * meant has to be asked rather than guessed - editing the title of next
+ * Tuesday's stand-up should not rename every stand-up there will ever be.
+ * ------------------------------------------------------------------ */
+let pendingScopeChoice = null;
+
+function isRecurring(event) {
+	return !!((event && (event.rrule || (event.extendedProps || {}).rrule)) || '').trim();
+}
+
+// Asks, and calls back with 'occurrence', 'series', or null for cancelled.
+function askRecurrenceScope(title, intro, onChoice) {
+	const modal = document.getElementById('scope-modal');
+	if (!modal) {
+		// No dialog to ask with: the safe answer is the smaller change.
+		onChoice('occurrence');
+		return;
+	}
+	document.getElementById('scope-modal-title').textContent = title;
+	document.getElementById('scope-modal-intro').textContent = intro;
+	pendingScopeChoice = onChoice;
+	modal.classList.add('show');
+}
+
+function resolveScope(choice) {
+	const modal = document.getElementById('scope-modal');
+	if (modal) modal.classList.remove('show');
+	const onChoice = pendingScopeChoice;
+	pendingScopeChoice = null;
+	if (onChoice) onChoice(choice);
+}
+
+// The scope the dialog is currently set to, and what that scope allows. How an
+// event repeats belongs to the series, so it cannot be edited from one
+// occurrence - the controls say so rather than being silently ignored.
+function scopeRowShowing() {
+	const row = document.getElementById('event-scope-row');
+	return !!row && 'none' !== row.style.display;
+}
+
+function currentScope() {
+	const sel = document.getElementById('event-scope');
+	return (scopeRowShowing() && sel) ? sel.value : 'series';
+}
+
+function refreshScopeUi() {
+	const sel = document.getElementById('event-scope');
+	if (!sel) return;
+	const showing = scopeRowShowing();
+	const one = 'occurrence' === currentScope();
+
+	['', 'unit', 'interval', 'end', 'count', 'until'].forEach(id => {
+		const el = repeatEl(id);
+		if (el) el.disabled = one;
+	});
+	repeatDayBoxes().forEach(box => { box.disabled = one; });
+
+	const hint = document.getElementById('event-scope-hint');
+	if (hint) {
+		hint.textContent = one
+			? 'Only this date changes. How the event repeats belongs to the series - switch above to change it.'
+			: 'Every occurrence changes, including any that were moved individually.';
+		hint.style.display = showing ? 'block' : 'none';
+	}
 }
 
 function applyFeatureToggles() {
@@ -1249,6 +1439,7 @@ eventClick: function(info) {
 		description: event.extendedProps?.description || '',
 		reminder: event.extendedProps?.reminder || '',
 		rrule: event.extendedProps?.rrule || '',
+		recurrenceId: event.extendedProps?.recurrenceId || '',
 		attendees: event.extendedProps?.attendees || '',
 		organizer: event.extendedProps?.organizer || '',
 		isOrganizer: false !== event.extendedProps?.isOrganizer
@@ -1265,11 +1456,11 @@ select: function(info) {
 },
 
 eventDrop: function(info) {
-updateEvent(info.event);
+	updateDraggedEvent(info);
 },
 
 eventResize: function(info) {
-updateEvent(info.event);
+	updateDraggedEvent(info);
 }
 });
 
@@ -1310,11 +1501,11 @@ return;
 			textColor: 'var(--cal-event-text)',
 			classNames: ['modern-event'],
 			extendedProps: {
-				// The series rule, and where in the series this instance sits.
-				// Both belong to the stored master, not to the copy the grid
-				// draws, so an edit here can be applied to the series.
+				// The series rule, and which occurrence of it this is. Both
+				// belong to the stored object rather than to the copy the grid
+				// draws, and both are needed to edit either one date or all.
 				rrule: event.rrule || '',
-				instanceStart: event.dtstart || event.start || '',
+				recurrenceId: event.recurrenceId || '',
 				location: event.location || '',
 				conference: event.conference || '',
 				geo: event.geo || '',
@@ -1469,9 +1660,27 @@ function formatDateOnly(date) {
 	return `${year}-${month}-${day}`;
 }
 
+// Dragging or resizing in the grid. One occurrence of a series can be moved on
+// its own or take the series with it, and only the person dragging it knows
+// which - so ask, and put it back where it was if they would rather not say.
+function updateDraggedEvent(info) {
+	const event = info.event;
+	if (!isRecurring(event)) {
+		updateEvent(event);
+		return;
+	}
+	askRecurrenceScope('Repeating event',
+		'"' + event.title + '" repeats. Move only this occurrence, or shift every'
+			+ ' occurrence by the same amount?',
+		choice => {
+			if (!choice) { info.revert(); return; }
+			updateEvent(event, undefined, choice);
+		});
+}
+
 // `repeat` comes from the dialog only. Dragging or resizing in the grid calls
 // this without it, so the stored rule is left alone.
-function updateEvent(event, repeat) {
+function updateEvent(event, repeat, scope) {
 
 	if (!rl.pluginRemoteRequest) return;
 	
@@ -1507,10 +1716,12 @@ function updateEvent(event, repeat) {
 		Conference: event.extendedProps?.conference,
 		Geo: event.extendedProps?.geo,
 		Description: event.extendedProps?.description,
-		// Which occurrence of a series this was before it was touched. The
-		// server shifts the whole series by the difference rather than moving
-		// it onto this one date.
-		RecurrenceId: event.extendedProps?.instanceStart,
+		// Which occurrence of the series this is - the date the rule gives it,
+		// not the date it may have been moved to. On a series-wide edit the
+		// server shifts everything by the difference; on a single occurrence it
+		// is the override's identity.
+		RecurrenceId: event.extendedProps?.recurrenceId,
+		Scope: scope || 'series',
 		EventId: eventId,
 		Title: event.title,
 		Start: startFormatted,
@@ -1520,18 +1731,27 @@ function updateEvent(event, repeat) {
 	});
 }
 
-function deleteEvent(eventId) {
-	
+function deleteEvent(eventId, scope, recurrenceId) {
+
 	if (!rl.pluginRemoteRequest || !eventId) return;
-	
+
 	rl.pluginRemoteRequest((iError, oData) => {
-		if (iError || !oData || !oData.Result) {
-			alert('Failed to delete event: ' + (oData?.Result?.message || 'Unknown error'));
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			// Say why, and put it back: the grid has already dropped it, and a
+			// row missing from the view but present on the server is worse than
+			// an error message.
+			alert((res && res.error) || 'Failed to delete event.');
+			if (calendar) calendar.refetchEvents();
 			return;
 		}
 		if (calendar) calendar.refetchEvents();
 	}, 'DeleteCalendarEvent', {
-		EventId: eventId
+		EventId: eventId,
+		// Removing one occurrence rewrites the series with that date excluded;
+		// removing the series deletes the resource outright.
+		Scope: scope || 'series',
+		RecurrenceId: recurrenceId || ''
 	});
 }
 
