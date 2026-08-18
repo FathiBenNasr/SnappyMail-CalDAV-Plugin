@@ -231,7 +231,7 @@ cal.innerHTML = `
 	<div class="event-modal">
 		<div class="event-modal-header">
 			<h2 class="event-modal-title" id="event-modal-title">New Event</h2>
-			<button class="event-modal-close">×</button>
+			<button class="event-modal-close" id="event-modal-close">×</button>
 		</div>
 		<div class="event-modal-body">
 			<form id="event-form">
@@ -375,7 +375,7 @@ cal.innerHTML = `
 		<div class="event-modal-footer">
 			<button class="event-modal-btn event-modal-btn-danger" id="event-delete-btn" style="display:none;">Delete</button>
 			<button class="event-modal-btn event-modal-btn-warning" id="event-cancel-meeting-btn" style="display:none;" title="Tell the guests it is off, then remove it">Cancel meeting</button>
-			<button class="event-modal-btn event-modal-btn-secondary">Cancel</button>
+			<button class="event-modal-btn event-modal-btn-secondary" id="event-cancel-btn">Cancel</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="event-save-btn">Save Event</button>
 		</div>
 	</div>
@@ -548,20 +548,20 @@ cal.innerHTML = `
 			if (el) el.addEventListener('click', () => resolveScope(scopeButtons[id]));
 		});
 
-		// Modal close buttons (override inline onclick)
-		const closeBtn = document.querySelector('.event-modal-close');
-		if (closeBtn) {
-			closeBtn.addEventListener('click', () => {
-				document.getElementById('event-modal').classList.remove('show');
-			});
-		}
-
-		const cancelBtn = document.querySelector('.event-modal-btn-secondary');
-		if (cancelBtn) {
-			cancelBtn.addEventListener('click', () => {
-				document.getElementById('event-modal').classList.remove('show');
-			});
-		}
+		// The dialog's own close and cancel buttons, by name. These used to be
+		// found by class with querySelector, which returns whichever match
+		// comes first in the document - so the day any button carrying those
+		// classes was added to the form above them, the footer's Cancel
+		// silently stopped closing anything and the new button quietly gained
+		// a second job.
+		['event-modal-close', 'event-cancel-btn'].forEach(id => {
+			const el = document.getElementById(id);
+			if (el) {
+				el.addEventListener('click', () => {
+					document.getElementById('event-modal').classList.remove('show');
+				});
+			}
+		});
 
 		// Also close modal when clicking overlay
 		const modalOverlay = document.getElementById('event-modal');
