@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+"""Turn a Cyrus CalendarAlarm event into a readable reminder email.
+
+calalarmd does not send anything itself: it fires an RFC 5423 event, which
+notifyd hands to this program on stdin as JSON. notifyd's own "mailto" method
+cannot be used here - it exists for Sieve, where the recipient comes from the
+script - so the mail is built and posted here instead.
+
+Anything that is not a calendar alarm is ignored, quietly: the notifier is a
+shared pipe and this program is only entitled to its own events.
+"""
+import datetime
+import email.header
+import email.utils
+import html
+import subprocess
+import sys
+import syslog
+import json
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                                    # pragma: no cover
+    ZoneInfo = None
+
+SENDMAIL = '/usr/sbin/sendmail'
+
+# Reminders come from a name people can recognise in a message list. The domain
+# follows the recipient's, so a message to a .cc address is not sent from a .tn
+# one: it keeps DMARC aligned per domain and reads as local to whoever gets it.
+# Each domain needs this as an alias, or a reply to a reminder hard-bounces.
+FROM_LOCALPART = 'notifications'
+FROM_NAME = 'Calendar'
+
+SAID = {
+    'ACCEPTED': 'going',
+    'DECLINED': 'not going',
+    'TENTATIVE': 'maybe',
+    'NEEDS-ACTION': 'no answer yet',
+    'DELEGATED': 'passed on',
+}
+
+
+def parse_stamp(stamp):
+    """20151119T073000Z, or the same without the Z, to an aware datetime."""
+    if not stamp:
+        return None
+    for form, utc in (('%Y%m%dT%H%M%SZ', True), ('%Y%m%dT%H%M%S', False),
+                      ('%Y%m%d', False)):
+        try:
+            when = datetime.datetime.strptime(stamp, form)
+        except ValueError:
+            continue
+        return when.replace(tzinfo=datetime.timezone.utc) if utc else when
+    return None
+
+
+def in_zone(when, zone):
+    """The same instant as the event's own calendar shows it."""
+    if when is None or when.tzinfo is None or not zone or ZoneInfo is None:
+        return when
+    try:
+        return when.astimezone(ZoneInfo(zone))
+    except Exception:
+        return when
+
+
+def say_when(start, end, all_day, zone):
+    """One line a person can read: the day, the hours, and the zone."""
+    if start is None:
+        return ''
+    start = in_zone(start, zone)
+    if all_day:
+        return start.strftime('%A %d %B %Y') + ', all day'
+
+    line = start.strftime('%A %d %B %Y, %H:%M')
+    end = in_zone(end, zone)
+    if end is not None and end > start:
+        same_day = end.date() == start.date()
+        line += ' - ' + end.strftime('%H:%M' if same_day else '%d %b %H:%M')
+    if start.tzname():
+        line += ' (%s)' % start.tzname()
+    return line
+
+
+def say_soon(start):
+    """How far off it is, from the moment the alarm was actually processed."""
+    if start is None or start.tzinfo is None:
+        return ''
+    delta = (start - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if -60 <= delta < 60:
+        return 'starting now'
+    if delta < 0:
+        delta, prefix = -delta, 'started '
+        suffix = ' ago'
+    else:
+        prefix, suffix = 'in ', ''
+    if delta < 3600:
+        amount = '%d minute%s' % (delta // 60, '' if 60 <= delta < 120 else 's')
+    elif delta < 86400:
+        hours = delta / 3600.0
+        amount = '%.0f hour%s' % (hours, '' if 0.5 <= hours < 1.5 else 's')
+    else:
+        days = delta / 86400.0
+        amount = '%.0f day%s' % (days, '' if 0.5 <= days < 1.5 else 's')
+    return prefix + amount + suffix
+
+
+def guests(event):
+    """[(name-or-address, what they said)], organiser first if named."""
+    names = event.get('attendeeNames') or []
+    mails = event.get('attendeeEmails') or []
+    stats = event.get('attendeeStatus') or []
+    out = []
+    for index, address in enumerate(mails):
+        address = str(address)
+        if address.lower().startswith('mailto:'):
+            address = address[7:]
+        name = str(names[index]) if index < len(names) and names[index] else address
+        said = str(stats[index]).upper() if index < len(stats) and stats[index] else ''
+        out.append((name, SAID.get(said, said.lower().replace('-', ' ') if said else '')))
+    return out
+
+
+def recipients(event):
+    """Who the reminder is for: the alarm's own recipients, else the owner."""
+    out = []
+    for one in event.get('alarmRecipients') or []:
+        addr = str(one)
+        out.append(addr[7:] if addr.lower().startswith('mailto:') else addr)
+    if not out and event.get('userId'):
+        out.append(str(event['userId']))
+    return [a.strip() for a in out if '@' in a]
+
+
+def build(event):
+    """(subject, text, html) for one alarm."""
+    summary = str(event.get('summary') or 'Untitled event').strip()
+    zone = str(event.get('timezone') or '')
+    all_day = bool(event.get('allDay'))
+    start = parse_stamp(event.get('start'))
+    when = say_when(start, parse_stamp(event.get('end')), all_day, zone)
+    soon = say_soon(start)
+
+    facts = []
+    if when:
+        facts.append(('When', when + ((' - ' + soon) if soon else '')))
+    if event.get('location'):
+        facts.append(('Where', str(event['location'])))
+    if event.get('organizer'):
+        organiser = str(event['organizer'])
+        facts.append(('Organiser', organiser[7:] if organiser.lower().startswith('mailto:') else organiser))
+    if event.get('calendarName'):
+        facts.append(('Calendar', str(event['calendarName'])))
+
+    people = guests(event)
+    description = str(event.get('description') or '').strip()
+
+    subject = 'Reminder: %s' % summary.replace('\n', ' ')[:180]
+    if soon:
+        subject = 'Reminder (%s): %s' % (soon, summary.replace('\n', ' ')[:160])
+
+    text = [summary, '=' * min(len(summary), 60), '']
+    for label, value in facts:
+        text.append('%-10s %s' % (label + ':', value))
+    if people:
+        text.append('')
+        text.append('Guests:')
+        for name, said in people:
+            text.append('  - %s%s' % (name, (' (%s)' % said) if said else ''))
+    if description:
+        text += ['', description]
+    text += ['', '--', 'Sent by the calendar server. Replies are not read.']
+
+    rows = ''.join(
+        '<tr><td style="padding:4px 14px 4px 0;color:#666;white-space:nowrap;'
+        'vertical-align:top">%s</td><td style="padding:4px 0">%s</td></tr>'
+        % (html.escape(label), html.escape(value))
+        for label, value in facts)
+    if people:
+        listed = ''.join(
+            '<li style="margin:2px 0">%s%s</li>'
+            % (html.escape(name),
+               ('<span style="color:#666"> &mdash; %s</span>' % html.escape(said)) if said else '')
+            for name, said in people)
+        rows += ('<tr><td style="padding:4px 14px 4px 0;color:#666;vertical-align:top">Guests</td>'
+                 '<td style="padding:4px 0"><ul style="margin:0;padding-left:18px">%s</ul></td></tr>'
+                 % listed)
+
+    note = ('<p style="margin:18px 0 0;padding:12px 14px;background:#f5f7f9;'
+            'border-radius:6px;white-space:pre-wrap">%s</p>' % html.escape(description)
+            ) if description else ''
+
+    page = (
+        '<!doctype html><html><body style="margin:0;padding:0;'
+        'background:#f0f2f4;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">'
+        '<div style="max-width:560px;margin:0 auto;padding:24px 16px">'
+        '<div style="background:#fff;border-radius:10px;overflow:hidden;'
+        'box-shadow:0 1px 3px rgba(0,0,0,.12)">'
+        '<div style="background:linear-gradient(135deg,#00639a,#0082c9);color:#fff;padding:18px 22px">'
+        '<div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;opacity:.85">Reminder%s</div>'
+        '<div style="font-size:20px;font-weight:600;margin-top:4px">%s</div></div>'
+        '<div style="padding:18px 22px;color:#1a1a1a;font-size:14px;line-height:1.5">'
+        '<table style="border-collapse:collapse;width:100%%">%s</table>%s</div></div>'
+        '<p style="color:#8a8a8a;font-size:12px;text-align:center;margin:14px 0 0">'
+        'Sent by the calendar server. Replies are not read.</p>'
+        '</div></body></html>'
+        % ((' &middot; ' + html.escape(soon)) if soon else '',
+           html.escape(summary), rows, note))
+
+    return subject, '\n'.join(text), page
+
+
+def post(to, subject, text, page):
+    domain = to[0].split('@')[-1]
+    boundary = email.utils.make_msgid(domain='alarm').strip('<>').replace('@', '-')
+    headers = [
+        'From: %s' % email.utils.formataddr((FROM_NAME, '%s@%s' % (FROM_LOCALPART, domain))),
+        'To: %s' % ', '.join(to),
+        'Subject: %s' % email.header.Header(subject, 'utf-8').encode(),
+        'Date: %s' % email.utils.formatdate(localtime=True),
+        'Message-ID: %s' % email.utils.make_msgid(domain=domain),
+        'Auto-Submitted: auto-generated',
+        'X-Auto-Response-Suppress: All',
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/alternative; boundary="%s"' % boundary,
+        '',
+    ]
+    body = (
+        'This is a message in MIME format.\r\n'
+        '--%(b)s\r\nContent-Type: text/plain; charset=utf-8\r\n'
+        'Content-Transfer-Encoding: 8bit\r\n\r\n%(t)s\r\n'
+        '--%(b)s\r\nContent-Type: text/html; charset=utf-8\r\n'
+        'Content-Transfer-Encoding: 8bit\r\n\r\n%(h)s\r\n'
+        '--%(b)s--\r\n'
+    ) % {'b': boundary, 't': text.replace('\n', '\r\n'), 'h': page}
+
+    subprocess.run([SENDMAIL, '-i', '-f', ''] + to,
+                   input=('\r\n'.join(headers) + body).encode('utf-8'),
+                   check=True, timeout=30)
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        event = json.loads(raw[raw.index('{'):raw.rindex('}') + 1])
+    except (ValueError, IndexError):
+        return 0
+    if 'CalendarAlarm' != event.get('event'):
+        return 0
+
+    to = recipients(event)
+    if not to:
+        syslog.syslog(syslog.LOG_WARNING, 'calendar alarm with no recipient')
+        return 0
+    try:
+        subject, text, page = build(event)
+        post(to, subject, text, page)
+    except (OSError, subprocess.SubprocessError, ValueError) as err:
+        syslog.syslog(syslog.LOG_ERR, 'calendar alarm not sent: %s' % err)
+        return 1
+    syslog.syslog(syslog.LOG_INFO, 'calendar alarm sent to %s' % ', '.join(to))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
