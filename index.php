@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.10',
+		VERSION  = '2.11',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -22,6 +22,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('UpdateCalendarEvent', 'DoUpdateCalendarEvent');
 		$this->addJsonHook('DeleteCalendarEvent', 'DoDeleteCalendarEvent');
 		$this->addJsonHook('CancelCalendarEvent', 'DoCancelCalendarEvent');
+		$this->addJsonHook('RespondCalendarEvent', 'DoRespondCalendarEvent');
 		$this->addJsonHook('SuggestAttendees', 'DoSuggestAttendees');
 		$this->addJsonHook('NewConferenceUrl', 'DoNewConferenceUrl');
 		$this->addJsonHook('SearchPlaces', 'DoSearchPlaces');
@@ -92,6 +93,119 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		}
 		$sAddr = \trim(\preg_replace('#^mailto:#i', '', (string) $oEvent->ORGANIZER));
 		return 0 === \strcasecmp($sAddr, $sSelf);
+	}
+
+	/**
+	 * This account's own ATTENDEE line, which is the only part of a meeting
+	 * somebody else organised that they are entitled to change.
+	 *
+	 * @return \Sabre\VObject\Property|null
+	 */
+	private function attendeeFor($oEvent, string $sSelf)
+	{
+		if (!isset($oEvent->ATTENDEE) || !\strlen($sSelf)) {
+			return null;
+		}
+		foreach ($oEvent->ATTENDEE as $oAttendee) {
+			$sAddr = \trim(\preg_replace('#^mailto:#i', '', (string) $oAttendee));
+			if (0 === \strcasecmp($sAddr, $sSelf)) {
+				return $oAttendee;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Who was invited and what each of them said, for showing rather than for
+	 * editing. The addresses alone were never the interesting part: an
+	 * invitation is a question, and this is where the answers are.
+	 */
+	private function guestList($oEvent, string $sSelf) : array
+	{
+		if (!isset($oEvent->ATTENDEE)) {
+			return array();
+		}
+		$sOrganizer = \strtolower(\trim(\preg_replace('#^mailto:#i', '',
+			(string) ($oEvent->ORGANIZER ?? ''))));
+		$aResult = array();
+		foreach ($oEvent->ATTENDEE as $oAttendee) {
+			$sAddr = \trim(\preg_replace('#^mailto:#i', '', (string) $oAttendee));
+			if (!\strlen($sAddr)) {
+				continue;
+			}
+			$sName = \trim((string) ($oAttendee['CN'] ?? ''));
+			$aResult[\strtolower($sAddr)] = array(
+				'address'     => $sAddr,
+				'name'        => (\strlen($sName) && 0 !== \strcasecmp($sName, $sAddr)) ? $sName : '',
+				'partstat'    => \strtoupper(\trim((string) ($oAttendee['PARTSTAT'] ?? 'NEEDS-ACTION'))),
+				'role'        => \strtoupper(\trim((string) ($oAttendee['ROLE'] ?? 'REQ-PARTICIPANT'))),
+				'isSelf'      => \strlen($sSelf) && 0 === \strcasecmp($sAddr, $sSelf),
+				'isOrganizer' => \strtolower($sAddr) === $sOrganizer
+			);
+		}
+		return \array_values($aResult);
+	}
+
+	/**
+	 * Answer an invitation: set this account's own PARTSTAT and nothing else.
+	 *
+	 * A guest replying is not a guest editing. RFC 5546 3.2.3 has the reply
+	 * carry back the SEQUENCE it was sent, so this deliberately does not raise
+	 * it - a raised SEQUENCE would tell the organiser's client that the meeting
+	 * itself had been rescheduled, by someone with no standing to reschedule
+	 * it. Nothing else on the event is touched for the same reason.
+	 *
+	 * The reply itself is not built or sent here. Under RFC 6638 the server
+	 * sees the changed PARTSTAT on the stored event and mails the REPLY to the
+	 * organiser, exactly as it mails the invitations.
+	 *
+	 * Returns the rewritten object, or null when there is nothing to answer.
+	 */
+	private function applyResponse(string $sExisting, string $sSelf, string $sPartstat,
+		string $sRecurrenceId, string $sScope) : ?string
+	{
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sExisting, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VEVENT)) {
+				return null;
+			}
+			$oMaster = $this->seriesMaster($oVCal) ?: $oVCal->VEVENT;
+
+			// One date of a series can be answered differently from the rest -
+			// that is what an override is for - but only if there is a series.
+			$aTargets = array();
+			if ('occurrence' === $sScope && \strlen($sRecurrenceId) && isset($oMaster->RRULE)) {
+				$oOne = $this->occurrenceOverride($oVCal, $oMaster, $sRecurrenceId);
+				if (null === $oOne) {
+					return null;
+				}
+				$aTargets[] = $oOne;
+			} else {
+				// Answering the series answers the overrides with it, or the
+				// dates somebody moved would keep asking.
+				foreach ($oVCal->VEVENT as $oEvent) {
+					$aTargets[] = $oEvent;
+				}
+			}
+
+			$bAnswered = false;
+			foreach ($aTargets as $oEvent) {
+				$oAttendee = $this->attendeeFor($oEvent, $sSelf);
+				if (!$oAttendee) {
+					continue;
+				}
+				$oAttendee['PARTSTAT'] = $sPartstat;
+				// The organiser asked for an answer and now has one.
+				unset($oAttendee['RSVP']);
+				$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
+				$bAnswered = true;
+			}
+
+			return $bAnswered ? $oVCal->serialize() : null;
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'reply failed: ' . $oException->getMessage());
+			return null;
+		}
 	}
 
 	private function listAttendees($oEvent) : string
@@ -1769,6 +1883,11 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				}
 
 				$sUid = (string) ($oEvent->UID ?? '');
+
+				// Whether this account was invited, and what it has said so
+				// far. Empty when it is not a guest, which is what tells the
+				// dialog there is no invitation here to answer.
+				$oMine = $this->attendeeFor($oEvent, $sSelf);
 				$aResult[] = [
 					'uid'         => $sUid,
 					'rrule'       => $aRules[$sUid] ?? '',
@@ -1785,6 +1904,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					'attendees'   => $this->listAttendees($oEvent),
 					'organizer'   => $this->organizerLabel($oEvent),
 					'isOrganizer' => $this->isOrganizer($oEvent, $sSelf),
+					'partstat'    => $oMine
+						? \strtoupper(\trim((string) ($oMine['PARTSTAT'] ?? 'NEEDS-ACTION')))
+						: '',
+					'guests'      => $this->guestList($oEvent, $sSelf),
 					'alarms'      => $this->extractAlarms($oEvent, $oDtStart->getDateTime(), $oEndDt)
 				];
 			}
@@ -2264,6 +2387,77 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		}
 	}
 	
+	/**
+	 * Answer an invitation: going, not going, or maybe.
+	 *
+	 * The reply travels the same way the invitation did. Under RFC 6638 the
+	 * server owns scheduling: it sees this account's PARTSTAT change on the
+	 * stored event and mails the REPLY to the organiser, whose client then
+	 * shows the answer beside the name. So there is nothing to build here
+	 * beyond the one line the guest is entitled to change.
+	 */
+	public function DoRespondCalendarEvent() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			if (!$oAccount) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Not logged in']);
+			}
+
+			$aConfig = $this->getCalendarConfig($oAccount);
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Calendar not configured']);
+			}
+
+			$sEventId  = \trim((string) $this->jsonParam('EventId', ''));
+			$sPartstat = \strtoupper(\trim((string) $this->jsonParam('Partstat', '')));
+			if (!\strlen($sEventId)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Event ID required']);
+			}
+			// Three answers, and nothing else: PARTSTAT goes into the stored
+			// event, so anything not on this list has no business reaching it.
+			// DELEGATED is left out because delegating is not answering - it
+			// needs a DELEGATED-TO and a new invitation, which this does not do.
+			if (!\in_array($sPartstat, array('ACCEPTED', 'DECLINED', 'TENTATIVE'), true)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Unknown answer']);
+			}
+
+			$oMainAccount = $this->Manager()->Actions()->GetMainAccountFromToken();
+			if (!$oMainAccount || !\method_exists($oMainAccount, 'CryptKey')) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => 'Cannot access encryption key']);
+			}
+			$sPassword = \SnappyMail\Crypt::DecryptFromJSON($aConfig['Password'], $oMainAccount->CryptKey());
+			if (\is_object($sPassword) && \method_exists($sPassword, '__toString')) {
+				$sPassword = (string) $sPassword;
+			}
+
+			$sEventUrl = $this->resolveEventHref($aConfig, $sPassword, $sEventId)
+				?: \rtrim($aConfig['CalDAVUrl'], '/') . '/' . ($aConfig['Collection'] ?? 'Default')
+					. '/' . \rawurlencode($sEventId) . '.ics';
+
+			$aFetch = $this->makeCalDAVRequest($sEventUrl, 'GET', $aConfig['User'], $sPassword);
+			$sICS = (200 === (int) $aFetch['code'] && \strlen((string) $aFetch['body']))
+				? $this->applyResponse((string) $aFetch['body'], $oAccount->Email(), $sPartstat,
+					\trim((string) $this->jsonParam('RecurrenceId', '')),
+					\strtolower((string) $this->jsonParam('Scope', 'series')))
+				: null;
+			if (null === $sICS) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false,
+					'error' => 'Could not answer this invitation: the event was not readable, or you are not one of its guests.']);
+			}
+
+			$aResult = $this->makeCalDAVRequest($sEventUrl, 'PUT', $aConfig['User'], $sPassword,
+				$sICS, ['Content-Type: text/calendar; charset=utf-8']);
+			return $this->jsonResponse(__FUNCTION__,
+				\in_array((int) $aResult['code'], array(200, 201, 204), true)
+					? ['success' => true, 'partstat' => $sPartstat]
+					: ['success' => false, 'error' => 'CalDAV error: ' . $aResult['code']]);
+
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
 	/**
 	 * Cancel a meeting: tell the guests it is off, then remove it.
 	 *

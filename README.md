@@ -84,7 +84,35 @@ The field completes as you type, from the same sources SnappyMail uses when you
 address a message. How far it reaches is a deployment decision - see
 **Complete attendees from the whole directory** below.
 
-Replies update the attendee list as the participants answer.
+Replies update the attendee list as the participants answer, and the dialog
+lists each guest beside what they said.
+
+### Answering an invitation
+
+A meeting somebody else organised shows **Are you going?** — Yes, Maybe, No —
+with the current answer marked. The plugin could previously only ask the
+question; this is the half the user does most often.
+
+Answering writes one thing: this account's own `PARTSTAT` on the stored event.
+Nothing else is touched, and `SEQUENCE` deliberately is not raised — under
+[RFC 5546](https://www.rfc-editor.org/rfc/rfc5546) §3.2.3 a reply carries back
+the sequence it was sent, and raising it would tell the organiser's client that
+the meeting had been rescheduled, by someone with no standing to reschedule it.
+The `REPLY` itself is not built here either: the server sees the changed
+`PARTSTAT` and mails it, exactly as it mails the invitations.
+
+A repeating invitation asks whether the answer is for that date or for the
+standing arrangement. Answering one date writes a `RECURRENCE-ID` override, so
+declining a single stand-up leaves the rest accepted; answering the series
+answers the overrides with it, or a date somebody had moved would go on asking
+after the question was settled. "This and all following" is not offered — a
+reply is not a rescheduling, and splitting a series to answer half of it would
+be one guest rewriting everyone's meeting.
+
+In the grid, an invitation nobody has answered is drawn with a dashed border,
+and one that was declined is struck through. Delegation is not implemented:
+`DELEGATED` needs a `DELEGATED-TO` and an invitation to the delegate, which is
+sending a new invitation rather than answering this one.
 
 Editing a saved event re-sends the guest list, so adding or removing someone
 invites or uninvites them. `SEQUENCE` is advanced whenever the time or the guest

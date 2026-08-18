@@ -185,6 +185,16 @@ cal.innerHTML = `
 .event-form-select:disabled, .event-form-input:disabled { opacity: .5; cursor: not-allowed; }
 .event-repeat-days label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .event-modal-narrow { max-width: 460px; }
+.event-rsvp-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.event-rsvp-btn { padding: 7px 14px; border: 1px solid var(--cal-border); border-radius: 6px; background: var(--cal-bg-tertiary); color: var(--cal-text-primary); cursor: pointer; font-size: 13px; }
+.event-rsvp-btn:hover { border-color: var(--cal-accent); }
+.event-rsvp-btn[aria-pressed="true"] { background: var(--cal-accent); border-color: var(--cal-accent); color: #fff; }
+.event-guests { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; font-size: 12px; }
+.event-guest { display: flex; gap: 8px; align-items: baseline; }
+.event-guest-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event-guest-said { opacity: .75; white-space: nowrap; }
+.modern-event.event-unanswered { border-style: dashed; }
+.modern-event.event-declined { opacity: .55; text-decoration: line-through; }
 .event-skip-list { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 .event-skip-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid var(--cal-border); border-radius: 999px; font-size: 12px; }
 .event-skip-chip button { border: 0; background: none; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; opacity: .65; }
@@ -348,10 +358,23 @@ cal.innerHTML = `
 					<label class="event-form-label">Organizer</label>
 					<div class="event-organizer-value" id="event-organizer"></div>
 				</div>
+				<div class="event-form-group" id="event-rsvp-row" style="display:none;">
+					<label class="event-form-label">Are you going?</label>
+					<div class="event-rsvp-row">
+						<button type="button" class="event-rsvp-btn" id="event-rsvp-accepted"
+							data-partstat="ACCEPTED" aria-pressed="false">Yes</button>
+						<button type="button" class="event-rsvp-btn" id="event-rsvp-tentative"
+							data-partstat="TENTATIVE" aria-pressed="false">Maybe</button>
+						<button type="button" class="event-rsvp-btn" id="event-rsvp-declined"
+							data-partstat="DECLINED" aria-pressed="false">No</button>
+					</div>
+					<small class="event-field-hint" id="event-rsvp-hint"></small>
+				</div>
 				<div class="event-form-group">
 					<label class="event-form-label">Invite</label>
 					<input type="text" class="event-form-input" id="event-attendees" placeholder="email@example.com, another@example.com">
 					<small style="opacity:.7">Invitations are sent by the calendar server once the event is saved.</small>
+					<div class="event-guests" id="event-guests"></div>
 				</div>
 				<div class="event-form-group">
 					<label class="event-form-label">Description</label>
@@ -537,6 +560,9 @@ cal.innerHTML = `
 		if (scopeSel) scopeSel.addEventListener('change', refreshScopeUi);
 		const skipAdd = document.getElementById('event-skip-add');
 		if (skipAdd) skipAdd.addEventListener('click', addSkippedDate);
+		document.querySelectorAll('.event-rsvp-btn').forEach(btn => {
+			btn.addEventListener('click', () => answerInvitation(btn.dataset.partstat));
+		});
 		const scopeButtons = {
 			'scope-modal-occurrence': 'occurrence',
 			'scope-modal-following': 'following',
@@ -669,6 +695,10 @@ function openEventModal(eventData = null, fcEvent = null) {
 		if (skipRow) skipRow.style.display = repeats ? 'block' : 'none';
 		loadSkippedDates(eventData.skipped);
 		refreshScopeUi();
+
+		// Somebody else's meeting: an invitation to answer, and the answers
+		// everyone else has given.
+		showInvitation(eventData);
 	} else {
 		// New event mode - default to timed event (not all-day) so time picker is visible
 		modalTitle.textContent = 'New Event';
@@ -685,6 +715,7 @@ function openEventModal(eventData = null, fcEvent = null) {
 		if (skipRowNew) skipRowNew.style.display = 'none';
 		loadSkippedDates([]);
 		refreshScopeUi();
+		showInvitation({});
 		currentEventGeo = '';
 		const now = new Date();
 		const end = new Date(now.getTime() + 3600000); // 1 hour later
@@ -1256,6 +1287,101 @@ function repeatPayload(startDate, allDay) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Answering an invitation
+ *
+ * An invitation is a question, and until now this plugin could only ask
+ * it. The answer is one word - the guest's own PARTSTAT - and it travels
+ * the way the invitation did: the server sees it change on the stored
+ * event and mails the REPLY to the organiser (RFC 6638). So there is
+ * nothing to compose here, only something to say.
+ * ------------------------------------------------------------------ */
+const PARTSTAT_SAID = {
+	ACCEPTED: 'Going',
+	DECLINED: 'Not going',
+	TENTATIVE: 'Maybe',
+	'NEEDS-ACTION': 'No answer yet',
+	DELEGATED: 'Passed on to someone else'
+};
+
+function partstatSaid(value) {
+	return PARTSTAT_SAID[(value || '').toUpperCase()] || (value || '');
+}
+
+// Only a guest has an invitation to answer. The organiser's own attendance is
+// not in doubt, and an event nobody was invited to is not a meeting.
+function invitationFor(event) {
+	const props = (event && event.extendedProps) || event || {};
+	const mine = (props.partstat || '').toUpperCase();
+	return (mine && false === props.isOrganizer) ? mine : '';
+}
+
+function showInvitation(eventData) {
+	const row = document.getElementById('event-rsvp-row');
+	const mine = invitationFor(eventData);
+	if (row) row.style.display = mine ? 'block' : 'none';
+
+	document.querySelectorAll('.event-rsvp-btn').forEach(btn => {
+		btn.setAttribute('aria-pressed', String(btn.dataset.partstat === mine));
+	});
+	const hint = document.getElementById('event-rsvp-hint');
+	if (hint) {
+		hint.textContent = 'NEEDS-ACTION' === mine
+			? 'The organiser is waiting for an answer.'
+			: 'You said: ' + partstatSaid(mine) + '. Answering again changes it.';
+	}
+	showGuests(eventData);
+}
+
+// Who else was asked, and what they said. The addresses alone were never the
+// interesting part once invitations could be sent.
+function showGuests(eventData) {
+	const box = document.getElementById('event-guests');
+	if (!box) return;
+	const guests = ((eventData && eventData.guests) || []).filter(g => g && g.address);
+	box.textContent = '';
+	if (2 > guests.length) return;
+
+	guests.forEach(guest => {
+		const line = document.createElement('div');
+		line.className = 'event-guest';
+		const who = document.createElement('span');
+		who.className = 'event-guest-name';
+		who.textContent = (guest.name || guest.address)
+			+ (guest.isOrganizer ? ' (organiser)' : '') + (guest.isSelf ? ' (you)' : '');
+		who.title = guest.address;
+		const said = document.createElement('span');
+		said.className = 'event-guest-said';
+		said.textContent = partstatSaid(guest.partstat);
+		line.appendChild(who);
+		line.appendChild(said);
+		box.appendChild(line);
+	});
+}
+
+// Answering a repeating invitation can mean this date or the standing
+// arrangement, and the two are far enough apart to ask. "This and all
+// following" is not offered: a reply is not a rescheduling, and splitting the
+// series to answer one half of it would be one guest rewriting everyone's
+// meeting.
+function answerInvitation(partstat) {
+	const event = currentEditingEvent;
+	if (!event || !invitationFor(event)) return;
+
+	const send = (scope) => {
+		respondToEvent(event, partstat, scope);
+		document.getElementById('event-modal').classList.remove('show');
+		currentEditingEvent = null;
+	};
+	if (isRecurring(event)) {
+		askRecurrenceScope('Repeating invitation',
+			'"' + event.title + '" repeats. Answer for this date only, or for every occurrence?',
+			choice => { if (choice) send(choice); }, true);
+		return;
+	}
+	send('series');
+}
+
+/* ------------------------------------------------------------------ *
  * This occurrence, or the whole series
  *
  * A repeating event is one object on the server: a master carrying the rule,
@@ -1272,7 +1398,7 @@ function isRecurring(event) {
 
 // Asks, and calls back with 'occurrence', 'following', 'series', or null for
 // cancelled.
-function askRecurrenceScope(title, intro, onChoice) {
+function askRecurrenceScope(title, intro, onChoice, twoWay) {
 	const modal = document.getElementById('scope-modal');
 	if (!modal) {
 		// No dialog to ask with: the safe answer is the smaller change.
@@ -1281,6 +1407,10 @@ function askRecurrenceScope(title, intro, onChoice) {
 	}
 	document.getElementById('scope-modal-title').textContent = title;
 	document.getElementById('scope-modal-intro').textContent = intro;
+	// Some questions have only two answers - a reply is not a rescheduling,
+	// so there is no half of a series to answer for.
+	const following = document.getElementById('scope-modal-following');
+	if (following) following.style.display = twoWay ? 'none' : 'block';
 	pendingScopeChoice = onChoice;
 	modal.classList.add('show');
 }
@@ -1594,6 +1724,8 @@ eventClick: function(info) {
 		rrule: event.extendedProps?.rrule || '',
 		recurrenceId: event.extendedProps?.recurrenceId || '',
 		skipped: event.extendedProps?.skipped || [],
+		partstat: event.extendedProps?.partstat || '',
+		guests: event.extendedProps?.guests || [],
 		attendees: event.extendedProps?.attendees || '',
 		organizer: event.extendedProps?.organizer || '',
 		isOrganizer: false !== event.extendedProps?.isOrganizer
@@ -1653,7 +1785,12 @@ return;
 			backgroundColor: 'var(--cal-event-bg)',
 			borderColor: 'var(--cal-event-border)',
 			textColor: 'var(--cal-event-text)',
-			classNames: ['modern-event'],
+			// An invitation nobody has answered, and one that was turned down,
+			// should not look like an appointment that is going ahead.
+			classNames: ['modern-event'].concat(
+				(false === event.isOrganizer && 'NEEDS-ACTION' === (event.partstat || '').toUpperCase())
+					? ['event-unanswered'] : [],
+				'DECLINED' === (event.partstat || '').toUpperCase() ? ['event-declined'] : []),
 			extendedProps: {
 				// The series rule, and which occurrence of it this is. Both
 				// belong to the stored object rather than to the copy the grid
@@ -1661,6 +1798,11 @@ return;
 				rrule: event.rrule || '',
 				recurrenceId: event.recurrenceId || '',
 				skipped: event.skipped || [],
+				// What this account said about being there, and what everyone
+				// else said. Both belong to the stored event, not to the copy
+				// the grid draws.
+				partstat: event.partstat || '',
+				guests: event.guests || [],
 				location: event.location || '',
 				conference: event.conference || '',
 				geo: event.geo || '',
@@ -1886,6 +2028,29 @@ function updateEvent(event, repeat, scope, skipped) {
 		// Undefined otherwise - dragging in the grid must not disturb them.
 		Exdates: skipped,
 		...(repeat || {})
+	});
+}
+
+// Answering an invitation changes one word on the stored event, and the server
+// mails the REPLY from there. Nothing else about the event is sent: a guest
+// replying is not a guest editing, and the plugin has no business rewriting a
+// meeting it was merely invited to.
+function respondToEvent(event, partstat, scope) {
+	if (!rl.pluginRemoteRequest) return;
+	const eventId = event.id || event.extendedProps?.uid;
+	if (!eventId) return;
+
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Failed to answer this invitation.');
+		}
+		if (calendar) calendar.refetchEvents();
+	}, 'RespondCalendarEvent', {
+		EventId: eventId,
+		Partstat: partstat,
+		Scope: scope || 'series',
+		RecurrenceId: event.extendedProps?.recurrenceId || ''
 	});
 }
 
