@@ -51,7 +51,8 @@ another client. It now has a **Repeats** row offering the same presets
 Thunderbird does — daily, weekly, every weekday, bi-weekly, monthly, yearly —
 plus **Custom**, which opens interval, weekday and ending fields. The server
 assembles the `RRULE` from those. A single occurrence — or an occurrence and
-everything after it — can also be changed without disturbing the rest. See
+everything after it — can also be changed without disturbing the rest, and the
+dialog lists the dates a series skips so one can be added or put back. See
 **Repeating events** below.
 
 **Reminders work.** `VALARM` was ignored entirely, and the reminder control in
@@ -168,6 +169,29 @@ new half is taken away again rather than left standing alongside the dates it
 was meant to replace. Overrides after the cut are not carried across — they are
 tied by `RECURRENCE-ID` to instants of the old rule, and being free of them is
 the point of splitting.
+
+### Dates it skips
+
+A rule has no way to say "every Tuesday, except that one week in March".
+iCalendar states those dates separately, as `EXDATE` on the master, and the
+dialog shows them under **Dates it skips**: each one can be put back, and a
+date picker adds another. Deleting a single occurrence writes the same thing,
+so a date removed from the grid appears in this list.
+
+The list is shown for every series, including one whose rule these controls
+cannot express — skipping a date says nothing about the rule, so there is no
+reason to withhold it — and it is disabled under **This occurrence only**,
+where the exceptions being edited would belong to something else.
+
+Which occurrence a date names is worked out on the server, from the rule, and
+the nearest occurrence within a day of it is the one written. Two things need
+that latitude. The dialog shows a date in the reader's zone while the series
+may be kept in another, where a late-evening occurrence falls on the evening
+before — this plugin stores events in UTC, so in Tunis that is any occurrence
+after 23:00. And the time a date is picked *at* is only the time this
+occurrence starts, which an override may have moved. A date the series does not
+fall on at all is dropped rather than stored: an `EXDATE` that strikes out
+nothing would come back as a skipped date that skips nothing.
 
 Some rules are more than these controls can show — "the second Monday of the
 month", "the last weekday", anything with `BYSETPOS` or `BYMONTHDAY`. Those are

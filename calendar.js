@@ -185,6 +185,12 @@ cal.innerHTML = `
 .event-form-select:disabled, .event-form-input:disabled { opacity: .5; cursor: not-allowed; }
 .event-repeat-days label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .event-modal-narrow { max-width: 460px; }
+.event-skip-list { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.event-skip-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border: 1px solid var(--cal-border); border-radius: 999px; font-size: 12px; }
+.event-skip-chip button { border: 0; background: none; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; opacity: .65; }
+.event-skip-chip button:hover { opacity: 1; }
+.event-skip-chip button:disabled { cursor: not-allowed; opacity: .3; }
+.event-skip-none { font-size: 12px; opacity: .7; }
 .event-modal-footer-stacked { flex-direction: column; align-items: stretch; }
 .event-modal-footer-stacked .event-modal-btn { width: 100%; }
 .event-repeat-end { width: auto; flex: 0 0 auto; }
@@ -306,6 +312,17 @@ cal.innerHTML = `
 							style="display:none;" aria-label="Repeat until">
 					</div>
 					<small class="event-field-hint" id="event-repeat-hint"></small>
+				</div>
+				<div class="event-form-group" id="event-skip-row" style="display:none;">
+					<label class="event-form-label" for="event-skip-date">Dates it skips</label>
+					<div class="event-skip-list" id="event-skip-list"></div>
+					<div class="event-repeat-row">
+						<input type="date" class="event-form-input event-repeat-until" id="event-skip-date"
+							aria-label="Date to skip">
+						<button type="button" class="event-modal-btn event-modal-btn-secondary"
+							id="event-skip-add">Skip this date</button>
+					</div>
+					<small class="event-field-hint" id="event-skip-hint"></small>
 				</div>
 				<div class="event-form-group">
 					<label class="event-form-label" for="event-location">📍 Location</label>
@@ -518,6 +535,8 @@ cal.innerHTML = `
 		// grid as a question asked when something is dragged or deleted.
 		const scopeSel = document.getElementById('event-scope');
 		if (scopeSel) scopeSel.addEventListener('change', refreshScopeUi);
+		const skipAdd = document.getElementById('event-skip-add');
+		if (skipAdd) skipAdd.addEventListener('click', addSkippedDate);
 		const scopeButtons = {
 			'scope-modal-occurrence': 'occurrence',
 			'scope-modal-following': 'following',
@@ -639,8 +658,16 @@ function openEventModal(eventData = null, fcEvent = null) {
 		// was opened: that is what was clicked, and it is the smaller change.
 		const scopeRow = document.getElementById('event-scope-row');
 		const scopeSel = document.getElementById('event-scope');
-		if (scopeRow) scopeRow.style.display = isRecurring(eventData) ? 'block' : 'none';
+		const repeats = isRecurring(eventData);
+		if (scopeRow) scopeRow.style.display = repeats ? 'block' : 'none';
 		if (scopeSel) scopeSel.value = 'occurrence';
+
+		// The dates it leaves out. Shown for any series, including one whose
+		// rule these controls cannot express: skipping a date says nothing
+		// about the rule, so there is no reason to withhold it.
+		const skipRow = document.getElementById('event-skip-row');
+		if (skipRow) skipRow.style.display = repeats ? 'block' : 'none';
+		loadSkippedDates(eventData.skipped);
 		refreshScopeUi();
 	} else {
 		// New event mode - default to timed event (not all-day) so time picker is visible
@@ -654,6 +681,9 @@ function openEventModal(eventData = null, fcEvent = null) {
 		resetRepeatFields();
 		const scopeRowNew = document.getElementById('event-scope-row');
 		if (scopeRowNew) scopeRowNew.style.display = 'none';
+		const skipRowNew = document.getElementById('event-skip-row');
+		if (skipRowNew) skipRowNew.style.display = 'none';
+		loadSkippedDates([]);
 		refreshScopeUi();
 		currentEventGeo = '';
 		const now = new Date();
@@ -791,7 +821,7 @@ function saveEventFromModal() {
 		currentEditingEvent.setExtendedProp('conference', eventData.conference || '');
 		currentEditingEvent.setExtendedProp('geo', eventData.geo || '');
 		currentEditingEvent.setExtendedProp('description', eventData.description || '');
-		updateEvent(currentEditingEvent, eventData.repeat, currentScope());
+		updateEvent(currentEditingEvent, eventData.repeat, currentScope(), skippedPayload());
 	} else {
 		// Create new event
 		createEvent(eventData);
@@ -1107,6 +1137,111 @@ function describeRepeat() {
 
 // The repeat fields as the server wants them, or null when nothing about the
 // recurrence should be written - which is not the same as "does not repeat".
+/* ------------------------------------------------------------------ *
+ * Dates the series skips
+ *
+ * A recurring event is a rule, and a rule has no way to say "except that
+ * week". iCalendar puts those dates on the master as EXDATE, and this is
+ * where they are listed, added to and taken back off.
+ *
+ * They are held as the instants the server sent, not as the dates shown:
+ * a series stored in another zone can have an occurrence that falls on the
+ * evening before the date the reader sees, and the server snaps whatever
+ * arrives to the occurrence nearest it. Echoing back what it sent is
+ * therefore exact, and a date picked here only has to be close.
+ * ------------------------------------------------------------------ */
+let skippedDates = [];
+
+// What a stored exception is called in the reader's own zone. All-day series
+// state theirs as plain dates, which are already what they say they are.
+function skipLabel(value) {
+	const v = (value || '').trim();
+	if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+	const when = new Date(v);
+	return isNaN(when) ? v : formatDateOnly(when);
+}
+
+function loadSkippedDates(list) {
+	skippedDates = (list || []).slice(0, 366);
+	const picker = document.getElementById('event-skip-date');
+	if (picker) picker.value = '';
+	renderSkippedDates();
+}
+
+function renderSkippedDates() {
+	const list = document.getElementById('event-skip-list');
+	if (!list) return;
+	const frozen = 'occurrence' === currentScope();
+	list.textContent = '';
+	if (!skippedDates.length) {
+		const none = document.createElement('span');
+		none.className = 'event-skip-none';
+		none.textContent = 'None - every occurrence is kept.';
+		list.appendChild(none);
+	}
+	skippedDates.forEach((value, index) => {
+		const chip = document.createElement('span');
+		chip.className = 'event-skip-chip';
+		const label = document.createElement('span');
+		label.textContent = skipLabel(value);
+		const drop = document.createElement('button');
+		drop.type = 'button';
+		drop.textContent = '×';
+		drop.disabled = frozen;
+		drop.title = 'Put this date back';
+		drop.setAttribute('aria-label', 'Put ' + skipLabel(value) + ' back');
+		drop.addEventListener('click', () => {
+			skippedDates.splice(index, 1);
+			renderSkippedDates();
+		});
+		chip.appendChild(label);
+		chip.appendChild(drop);
+		list.appendChild(chip);
+	});
+
+	const hint = document.getElementById('event-skip-hint');
+	if (hint) {
+		hint.textContent = frozen
+			? 'The dates a series leaves out belong to the series - switch above to change them.'
+			: 'A date the event does not fall on cannot be skipped, and is dropped on saving.';
+	}
+}
+
+// The picker gives a date; the occurrence on it happens at the time this one
+// does, which is close enough for the server to snap to the right instant.
+function addSkippedDate() {
+	const picker = document.getElementById('event-skip-date');
+	const day = picker && picker.value;
+	if (!day || 'occurrence' === currentScope()) return;
+
+	const parts = day.split('-').map(n => parseInt(n, 10));
+	const allDay = document.getElementById('event-allday').checked;
+	let value = day;
+	if (!allDay) {
+		const from = new Date(document.getElementById('event-start').value);
+		const when = new Date(parts[0], parts[1] - 1, parts[2],
+			isNaN(from) ? 0 : from.getHours(), isNaN(from) ? 0 : from.getMinutes());
+		value = when.toISOString();
+	}
+	if (!skippedDates.some(v => skipLabel(v) === day)) {
+		skippedDates.push(value);
+		skippedDates.sort((a, b) => skipLabel(a).localeCompare(skipLabel(b)));
+	}
+	picker.value = '';
+	renderSkippedDates();
+}
+
+// Sent only when the dialog is showing the list and the scope allows it, on
+// the same terms as the repeat fields: silence leaves the stored ones alone,
+// which is what dragging in the grid has to do.
+function skippedPayload() {
+	const row = document.getElementById('event-skip-row');
+	if (!row || 'none' === row.style.display || 'occurrence' === currentScope()) {
+		return undefined;
+	}
+	return skippedDates.join(',');
+}
+
 function repeatPayload(startDate, allDay) {
 	if (unsupportedRepeat || !repeatEl('')) return null;
 	const shape = repeatShape();
@@ -1183,6 +1318,11 @@ function refreshScopeUi() {
 		if (el) el.disabled = one;
 	});
 	repeatDayBoxes().forEach(box => { box.disabled = one; });
+	const skipDate = document.getElementById('event-skip-date');
+	const skipAdd = document.getElementById('event-skip-add');
+	if (skipDate) skipDate.disabled = one;
+	if (skipAdd) skipAdd.disabled = one;
+	renderSkippedDates();
 
 	const hints = {
 		occurrence: 'Only this date changes. How the event repeats belongs to the series -'
@@ -1453,6 +1593,7 @@ eventClick: function(info) {
 		reminder: event.extendedProps?.reminder || '',
 		rrule: event.extendedProps?.rrule || '',
 		recurrenceId: event.extendedProps?.recurrenceId || '',
+		skipped: event.extendedProps?.skipped || [],
 		attendees: event.extendedProps?.attendees || '',
 		organizer: event.extendedProps?.organizer || '',
 		isOrganizer: false !== event.extendedProps?.isOrganizer
@@ -1519,6 +1660,7 @@ return;
 				// draws, and both are needed to edit either one date or all.
 				rrule: event.rrule || '',
 				recurrenceId: event.recurrenceId || '',
+				skipped: event.skipped || [],
 				location: event.location || '',
 				conference: event.conference || '',
 				geo: event.geo || '',
@@ -1693,7 +1835,7 @@ function updateDraggedEvent(info) {
 
 // `repeat` comes from the dialog only. Dragging or resizing in the grid calls
 // this without it, so the stored rule is left alone.
-function updateEvent(event, repeat, scope) {
+function updateEvent(event, repeat, scope, skipped) {
 
 	if (!rl.pluginRemoteRequest) return;
 	
@@ -1740,6 +1882,9 @@ function updateEvent(event, repeat, scope) {
 		Start: startFormatted,
 		End: endFormatted,
 		AllDay: event.allDay || false,
+		// The dates the series leaves out, when the dialog was showing them.
+		// Undefined otherwise - dragging in the grid must not disturb them.
+		Exdates: skipped,
 		...(repeat || {})
 	});
 }

@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.8',
+		VERSION  = '2.9',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -155,6 +155,81 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$oExdate = $oEvent->add('EXDATE', '19700101', $bTimed ? array() : array('VALUE' => 'DATE'));
 			$oExdate->setDateTimes($aKept);
 		}
+	}
+
+	/**
+	 * The occurrences a series actually has at the instants named, within a day
+	 * either way. Returned in the zone the series is written in, ready to be
+	 * stated as EXDATE.
+	 *
+	 * Exceptions are named by when they fall rather than matched exactly
+	 * because the two ends disagree about what a date is: the dialog shows a
+	 * date in the reader's zone, and the series may be stored in another, where
+	 * a late-evening occurrence falls on the day before. Snapping to the
+	 * occurrence nearest what was asked for excludes the one the reader
+	 * actually pointed at, and a date the series never falls on excludes
+	 * nothing rather than writing an EXDATE that strikes out nothing.
+	 *
+	 * @return \DateTimeInterface[]
+	 */
+	private function resolveExdates($oEvent, array $aValues) : array
+	{
+		if (!isset($oEvent->RRULE) || !isset($oEvent->DTSTART) || !$aValues) {
+			return array();
+		}
+		$oStart = $oEvent->DTSTART->getDateTime();
+		$oZone  = $oStart->getTimezone() ?: new \DateTimeZone('UTC');
+
+		// Bucketed by day so each occurrence is checked against a handful of
+		// candidates rather than the whole list.
+		$aWanted = array();
+		$aDays   = array();
+		foreach (\array_slice($aValues, 0, 366) as $sValue) {
+			try {
+				$iWhen = (new \DateTime($sValue, new \DateTimeZone('UTC')))->getTimestamp();
+			} catch (\Throwable $oException) {
+				continue;
+			}
+			$iIndex = \count($aWanted);
+			$aWanted[$iIndex] = $iWhen;
+			foreach (array(-86400, 0, 86400) as $iNudge) {
+				$aDays[\gmdate('Y-m-d', $iWhen + $iNudge)][] = $iIndex;
+			}
+		}
+		if (!$aWanted) {
+			return array();
+		}
+
+		$aBest = array();
+		try {
+			$iStop = \max($aWanted) + 86400;
+			$iSeen = 0;
+			foreach (new \Sabre\VObject\Recur\RRuleIterator((string) $oEvent->RRULE, $oStart) as $oDate) {
+				if (!$oDate) {
+					break;
+				}
+				$iAt = $oDate->getTimestamp();
+				if ($iAt > $iStop || 10000 < ++$iSeen) {
+					break;
+				}
+				foreach ($aDays[\gmdate('Y-m-d', $iAt)] ?? array() as $iIndex) {
+					$iGap = \abs($iAt - $aWanted[$iIndex]);
+					if (86400 > $iGap && (!isset($aBest[$iIndex]) || $iGap < $aBest[$iIndex][0])) {
+						$aBest[$iIndex] = array($iGap, $iAt);
+					}
+				}
+			}
+		} catch (\Throwable $oException) {
+			// An unreadable rule has no occurrences to skip.
+			return array();
+		}
+
+		$aFound = array();
+		foreach ($aBest as $aPick) {
+			$aFound[$aPick[1]] = (new \DateTime('@' . $aPick[1]))->setTimezone($oZone);
+		}
+		\ksort($aFound);
+		return \array_values($aFound);
 	}
 
 	/**
@@ -460,6 +535,36 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				}
 			}
 
+			// Which of its dates the series leaves out. Sent as the instants the
+			// dialog is showing rather than as a rewritten EXDATE line, so what
+			// arrives is a list of dates and not iCalendar to be written out
+			// verbatim; each is snapped to the occurrence it names, and one
+			// naming no occurrence is dropped rather than stored as a line that
+			// strikes out nothing.
+			//
+			// This runs after the rule is settled above, because which
+			// occurrence a date names depends on the rule it is asked of.
+			$sOldSkips = '';
+			foreach ($oEvent->select('EXDATE') as $oProperty) {
+				$sOldSkips .= (string) $oProperty;
+			}
+			$mSkipped = $this->jsonParam('Exdates', null);
+			if (null !== $mSkipped && !$bOccurrence && isset($oEvent->RRULE)) {
+				$aSkipped = $this->resolveExdates($oEvent,
+					\preg_split('/[\s,;]+/', (string) $mSkipped, -1, PREG_SPLIT_NO_EMPTY) ?: array());
+				$oEvent->remove('EXDATE');
+				if ($aSkipped) {
+					$bTimedSkip = !isset($oEvent->DTSTART) || $oEvent->DTSTART->hasTime();
+					$oExdate = $oEvent->add('EXDATE', '19700101',
+						$bTimedSkip ? array() : array('VALUE' => 'DATE'));
+					$oExdate->setDateTimes($aSkipped);
+				}
+			}
+			$sNewSkips = '';
+			foreach ($oEvent->select('EXDATE') as $oProperty) {
+				$sNewSkips .= (string) $oProperty;
+			}
+
 			// Where it is, and where the call is. Same rule as the guest list
 			// below: only touched when the dialog actually sent the field, so an
 			// edit that never saw it cannot blank it. This is also why editing
@@ -553,7 +658,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sNewWhere = (string) ($oEvent->LOCATION ?? '') . "\0" . $this->conferenceUri($oEvent);
 			if ($bGuestsChanged || $sOldStart !== (string) $oEvent->DTSTART
 			 || $sOldEnd !== (string) $oEvent->DTEND || $sOldWhere !== $sNewWhere
-			 || $sOldRule !== (string) ($oEvent->RRULE ?? '')) {
+			 || $sOldRule !== (string) ($oEvent->RRULE ?? '') || $sOldSkips !== $sNewSkips) {
 				$oEvent->SEQUENCE = ((int) ((string) ($oEvent->SEQUENCE ?? '0'))) + 1;
 			}
 			$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
@@ -1586,11 +1691,25 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// could never show - let alone edit - how an event repeats.
 			$bRecurring = false;
 			$aRules = array();
+			$aSkips = array();
 			foreach ($oVCal->VEVENT as $oEvent) {
 				if (isset($oEvent->RRULE) || isset($oEvent->RDATE)) {
 					$bRecurring = true;
 					if (isset($oEvent->RRULE) && !isset($oEvent->{'RECURRENCE-ID'})) {
-						$aRules[(string) ($oEvent->UID ?? '')] = (string) $oEvent->RRULE;
+						$sKey = (string) ($oEvent->UID ?? '');
+						$aRules[$sKey] = (string) $oEvent->RRULE;
+
+						// The dates the series leaves out. expand() honours
+						// these by simply not producing those instances, so
+						// they have to be read off the master to be shown at
+						// all - and the dialog cannot offer to put one back
+						// without knowing it went.
+						$bSkipTimed = !isset($oEvent->DTSTART) || $oEvent->DTSTART->hasTime();
+						foreach ($oEvent->select('EXDATE') as $oProperty) {
+							foreach ($oProperty->getDateTimes() as $oDate) {
+								$aSkips[$sKey][] = $oDate->format($bSkipTimed ? 'c' : 'Y-m-d');
+							}
+						}
 					}
 				}
 			}
@@ -1653,6 +1772,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 				$aResult[] = [
 					'uid'         => $sUid,
 					'rrule'       => $aRules[$sUid] ?? '',
+					'skipped'     => $aSkips[$sUid] ?? array(),
 					'recurrenceId' => $sRecurrenceId,
 					'summary'     => (string) ($oEvent->SUMMARY ?? 'Untitled'),
 					'dtstart'     => $oDtStart->getDateTime()->format($sFmt),
