@@ -45,6 +45,13 @@ date. Parsing now uses the Sabre VObject library that ships with SnappyMail, and
 recurrences are expanded over a window around the current date. Non-recurring
 events bypass expansion so historic events are not truncated.
 
+**Recurring events can be created.** Expanding a series was only half of it:
+the dialog had no way to make one, so anything repeating had to be created in
+another client. It now has a **Repeats** row — daily, weekly, monthly or yearly,
+every *n* of those, on chosen weekdays when weekly, ending never, after *n*
+times, or on a date — which the server assembles into an `RRULE`. See
+**Repeating events** below for what it does with the ones it cannot express.
+
 **Reminders work.** `VALARM` was ignored entirely, and the reminder control in
 the event dialog only appended a marker string to the description — it alerted
 nothing, anywhere, and the value was never even sent to the server. Alarms are
@@ -106,6 +113,42 @@ event you organise *already* makes the server send a `CANCEL` of its own. So
 Delete is not a way to call a meeting off quietly — the difference is that
 Cancel states what was cancelled, and Delete leaves the guest's client to infer
 it.
+
+## Repeating events
+
+The **Repeats** row builds the rule out of named fields — frequency, interval,
+weekdays, and an ending — and the server assembles the `RRULE` from those. It
+never accepts a rule as a string: an `RRULE` is written straight into the
+iCalendar body, so taking one from the browser would hand it a line to write
+whatever it liked on. Every value is a fixed keyword or a bounded integer.
+
+The whole series lives in one event, which has consequences worth stating:
+
+* Editing a repeating event edits **every** occurrence, and Delete removes the
+  whole series — the button says so when it will. Editing or deleting a single
+  occurrence needs `RECURRENCE-ID` overrides and `EXDATE`, which this dialog
+  does not do yet; another client can still do it, and what it writes is left
+  alone.
+* Dragging or resizing one occurrence in the grid **moves the series** by that
+  much, rather than dropping it on that one date — the shift is applied to the
+  master event. Without this, dragging next week's stand-up would have moved the
+  entire series onto next week.
+* An event another client wrote in its own timezone keeps its `TZID` through
+  such an edit. Retyping it as UTC would freeze it against the next
+  daylight-saving change.
+
+Some rules are more than these controls can show — "the second Monday of the
+month", "the last weekday", anything with `BYSETPOS` or `BYMONTHDAY`. Those are
+read as *unknown*: the dropdown stays on "Does not repeat", and saving from the
+dialog deliberately sends nothing about recurrence, so the stored rule survives
+exactly as the other client wrote it. The alternative — showing a rule the
+dialog can only half-represent — would rewrite the series the moment anything
+else on it was edited.
+
+New events are stored in UTC, so the weekdays picked for a weekly series are
+translated to the weekday each one falls on *in UTC* before being written. A
+00:30 Monday meeting in UTC+1 is Sunday 23:30 in UTC, and a rule saying `MO`
+would repeat it a day late and add a stray occurrence on the start date.
 
 ## Configuration
 

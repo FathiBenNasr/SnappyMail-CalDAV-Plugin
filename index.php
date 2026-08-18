@@ -4,11 +4,15 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.5',
-		RELEASE  = '2026-08-17',
+		VERSION  = '2.6',
+		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
 		REQUIRED = '2.0.0';
+
+	// RFC 5545 weekday abbreviations, indexed the way both PHP's `w` and
+	// JavaScript's getDay() count: Sunday first.
+	private const RRULE_DAYS = array('SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA');
 
 	public function Init() : void
 	{
@@ -137,13 +141,66 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sOldStart = (string) ($oEvent->DTSTART ?? '');
 			$sOldEnd   = (string) ($oEvent->DTEND ?? '');
 			$sOldWhere = (string) ($oEvent->LOCATION ?? '') . "\0" . $this->conferenceUri($oEvent);
+			$sOldRule  = (string) ($oEvent->RRULE ?? '');
 
 			$oEvent->SUMMARY = $sTitle;
-			$aDateParams = $bAllDay ? array('VALUE' => 'DATE') : array();
-			$oEvent->remove('DTSTART');
-			$oEvent->remove('DTEND');
-			$oEvent->add('DTSTART', $sStart, $aDateParams);
-			$oEvent->add('DTEND', $sEnd, $aDateParams);
+
+			// A repeating event is shown one occurrence at a time, but its times
+			// live on the master. Writing the occurrence's own times there
+			// would drag the whole series onto that date, so move the master by
+			// however far this occurrence moved instead, and give it the new
+			// length. RecurrenceId is the occurrence's original start; the grid
+			// sends it whenever it has one.
+			//
+			// The times are edited in place rather than replaced, so a series
+			// another client wrote in its own timezone keeps its TZID - retyping
+			// it as UTC would freeze it against the next daylight-saving change.
+			$sRecurrenceId = \trim((string) $this->jsonParam('RecurrenceId', ''));
+			$bShifted = false;
+			if (\strlen($sRecurrenceId) && isset($oEvent->RRULE) && isset($oEvent->DTSTART)) {
+				try {
+					$oUtc    = new \DateTimeZone('UTC');
+					$iWas    = (new \DateTime($sRecurrenceId, $oUtc))->getTimestamp();
+					$iNow    = (new \DateTime($sStart, $oUtc))->getTimestamp();
+					$iLength = (new \DateTime($sEnd, $oUtc))->getTimestamp() - $iNow;
+					$oWhen   = $oEvent->DTSTART->getDateTime();
+					$oZone   = $oWhen->getTimezone() ?: $oUtc;
+					$iMaster = $oWhen->getTimestamp() + ($iNow - $iWas);
+
+					$oEvent->DTSTART->setDateTime(
+						(new \DateTime('@' . $iMaster))->setTimezone($oZone));
+					if (isset($oEvent->DTEND)) {
+						$oEvent->DTEND->setDateTime(
+							(new \DateTime('@' . ($iMaster + $iLength)))->setTimezone($oZone));
+					}
+					// No DTEND means the length is a DURATION, which the shift
+					// leaves correct on its own.
+					$bShifted = true;
+				} catch (\Throwable $oIgnored) {
+					// Unreadable occurrence: fall through and take the times as
+					// given, which is what happened before any of this existed.
+				}
+			}
+
+			if (!$bShifted) {
+				$aDateParams = $bAllDay ? array('VALUE' => 'DATE') : array();
+				$oEvent->remove('DTSTART');
+				$oEvent->remove('DTEND');
+				$oEvent->add('DTSTART', $sStart, $aDateParams);
+				$oEvent->add('DTEND', $sEnd, $aDateParams);
+			}
+
+			// How it repeats, under the same rule as the fields below: only
+			// rewritten when the dialog actually sent it, so dragging an
+			// occurrence in the grid cannot quietly flatten the series.
+			$mRepeat = $this->jsonParam('Repeat', null);
+			if (null !== $mRepeat) {
+				$sRRule = $this->buildRecurrenceRule((bool) $bAllDay);
+				$oEvent->remove('RRULE');
+				if (\strlen($sRRule)) {
+					$oEvent->add('RRULE', $sRRule);
+				}
+			}
 
 			// Where it is, and where the call is. Same rule as the guest list
 			// below: only touched when the dialog actually sent the field, so an
@@ -233,11 +290,12 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 
 			// SEQUENCE must advance on a change attendees need to hear about
 			// (RFC 5545 3.8.7.4), otherwise their clients ignore the update.
-			// Moving a meeting to a different room, or on to a different call,
-			// is exactly such a change.
+			// Moving a meeting to a different room, on to a different call, or
+			// on to a different schedule is exactly such a change.
 			$sNewWhere = (string) ($oEvent->LOCATION ?? '') . "\0" . $this->conferenceUri($oEvent);
 			if ($bGuestsChanged || $sOldStart !== (string) $oEvent->DTSTART
-			 || $sOldEnd !== (string) $oEvent->DTEND || $sOldWhere !== $sNewWhere) {
+			 || $sOldEnd !== (string) $oEvent->DTEND || $sOldWhere !== $sNewWhere
+			 || $sOldRule !== (string) ($oEvent->RRULE ?? '')) {
 				$oEvent->SEQUENCE = ((int) ((string) ($oEvent->SEQUENCE ?? '0'))) + 1;
 			}
 			$oEvent->DTSTAMP = new \DateTime('now', new \DateTimeZone('UTC'));
@@ -670,6 +728,65 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 	}
 
 	/**
+	 * The dialog's repeat fields as an RRULE value, or '' for a one-off.
+	 *
+	 * The rule is assembled here from named fields rather than accepted as a
+	 * ready-made string: an RRULE is written straight into the ICS body, so a
+	 * client-supplied one would be a line to inject arbitrary properties on.
+	 * Everything below is either a fixed keyword or a bounded integer.
+	 *
+	 * BYDAY is not derived from the picked weekdays here because DTSTART is
+	 * stored in UTC - see repeatDaysForServer() in calendar.js, which does the
+	 * translation while it still knows the organiser's timezone.
+	 */
+	private function buildRecurrenceRule(bool $bAllDay) : string
+	{
+		$sFreq = \strtoupper(\trim((string) $this->jsonParam('Repeat', '')));
+		if (!\in_array($sFreq, array('DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'), true)) {
+			return '';
+		}
+		$aParts = array('FREQ=' . $sFreq);
+
+		$iInterval = (int) $this->jsonParam('RepeatInterval', 1);
+		if (1 < $iInterval) {
+			$aParts[] = 'INTERVAL=' . \min($iInterval, 365);
+		}
+
+		if ('WEEKLY' === $sFreq) {
+			$aDays = array();
+			foreach (\preg_split('/[,\s]+/', (string) $this->jsonParam('RepeatDays', '')) as $sDay) {
+				$sDay = \strtoupper(\trim($sDay));
+				if (\in_array($sDay, self::RRULE_DAYS, true) && !\in_array($sDay, $aDays, true)) {
+					$aDays[] = $sDay;
+				}
+			}
+			if ($aDays) {
+				$aParts[] = 'BYDAY=' . \implode(',', $aDays);
+			}
+		}
+
+		$sEnd = \strtolower(\trim((string) $this->jsonParam('RepeatEnd', '')));
+		if ('count' === $sEnd) {
+			$iCount = (int) $this->jsonParam('RepeatCount', 0);
+			if (0 < $iCount) {
+				$aParts[] = 'COUNT=' . \min($iCount, 1000);
+			}
+		} elseif ('until' === $sEnd) {
+			$sUntil = \trim((string) $this->jsonParam('RepeatUntil', ''));
+			if (\preg_match('/^\d{4}-\d{2}-\d{2}$/', $sUntil)) {
+				// RFC 5545 3.3.10: UNTIL has to match DTSTART's value type, and
+				// a UTC DTSTART needs a UTC UNTIL. A whole-day series ends on
+				// the day itself; a timed one runs to the end of it, so the
+				// last day is included either way.
+				$sUntil = \str_replace('-', '', $sUntil);
+				$aParts[] = 'UNTIL=' . ($bAllDay ? $sUntil : $sUntil . 'T235959Z');
+			}
+		}
+
+		return \implode(';', $aParts);
+	}
+
+	/**
 	 * Plugin configuration mapping
 	 */
 	protected function configMapping() : array
@@ -1097,11 +1214,17 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			// Only recurring objects need expanding. Expanding everything would
 			// discard one-off events outside the window, and this calendar holds
 			// events from 2022 through 2038.
+			// The rule itself is worth keeping hold of: expand() hands back
+			// plain instances with no RRULE on them, so without this the dialog
+			// could never show - let alone edit - how an event repeats.
 			$bRecurring = false;
+			$aRules = array();
 			foreach ($oVCal->VEVENT as $oEvent) {
 				if (isset($oEvent->RRULE) || isset($oEvent->RDATE)) {
 					$bRecurring = true;
-					break;
+					if (isset($oEvent->RRULE) && !isset($oEvent->RECURRENCE_ID)) {
+						$aRules[(string) ($oEvent->UID ?? '')] = (string) $oEvent->RRULE;
+					}
 				}
 			}
 
@@ -1149,8 +1272,10 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 					$sLocation = '';
 				}
 
+				$sUid = (string) ($oEvent->UID ?? '');
 				$aResult[] = [
-					'uid'         => (string) ($oEvent->UID ?? ''),
+					'uid'         => $sUid,
+					'rrule'       => $aRules[$sUid] ?? '',
 					'summary'     => (string) ($oEvent->SUMMARY ?? 'Untitled'),
 					'dtstart'     => $oDtStart->getDateTime()->format($sFmt),
 					'dtend'       => $oEndDt->format($sFmt),
@@ -1410,6 +1535,15 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$sICS .= "DTSTAMP:" . gmdate('Ymd\THis\Z') . "\r\n";
 			$sICS .= "DTSTART" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sStartFormatted . "\r\n";
 			$sICS .= "DTEND" . ($bAllDay ? ';VALUE=DATE' : '') . ":" . $sEndFormatted . "\r\n";
+
+			// One VEVENT for the whole series: the times above are the first
+			// occurrence and the rule below generates the rest, which is what
+			// every other client expects to find.
+			$sRRule = $this->buildRecurrenceRule((bool) $bAllDay);
+			if (\strlen($sRRule)) {
+				$sICS .= "RRULE:" . $sRRule . "\r\n";
+			}
+
 			$sICS .= "SUMMARY:" . $this->escapeICS($sTitle) . "\r\n";
 			
 			if (!empty($sDescription)) {

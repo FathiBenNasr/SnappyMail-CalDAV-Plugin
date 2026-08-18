@@ -176,6 +176,19 @@ cal.innerHTML = `
 .event-field-hint { display: block; margin-top: 6px; font-size: 12px; opacity: .75; }
 .event-field-hint a { color: var(--cal-accent); }
 
+/* Recurrence */
+.event-repeat-detail { border-left: 2px solid var(--cal-border); padding-left: 12px; }
+.event-repeat-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
+.event-repeat-row:last-of-type { margin-bottom: 0; }
+.event-repeat-num { width: 5em; flex: 0 0 auto; }
+.event-repeat-end { width: auto; flex: 0 0 auto; }
+.event-repeat-until { width: auto; flex: 0 0 auto; }
+.event-repeat-days { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.event-repeat-days label { display: inline-flex; align-items: center; gap: 4px; padding: 5px 9px; border: 1px solid var(--cal-border); border-radius: 999px; font-size: 12px; cursor: pointer; user-select: none; }
+.event-repeat-days label:hover { border-color: var(--cal-accent); }
+.event-repeat-days input { margin: 0; }
+.event-repeat-days label:has(input:checked) { background: var(--cal-accent); border-color: var(--cal-accent); color: #fff; }
+
 /* Place picker */
 .place-search-row { display: flex; gap: 8px; }
 .place-results { margin-top: 12px; max-height: 320px; overflow-y: auto; border: 1px solid var(--cal-border); border-radius: 6px; }
@@ -229,6 +242,47 @@ cal.innerHTML = `
 						<input type="checkbox" id="event-allday">
 						<span>All-day event</span>
 					</label>
+				</div>
+				<div class="event-form-group">
+					<label class="event-form-label" for="event-repeat">🔁 Repeats</label>
+					<select class="event-form-select" id="event-repeat">
+						<option value="">Does not repeat</option>
+						<option value="DAILY">Daily</option>
+						<option value="WEEKLY">Weekly</option>
+						<option value="MONTHLY">Monthly</option>
+						<option value="YEARLY">Yearly</option>
+					</select>
+				</div>
+				<div class="event-form-group event-repeat-detail" id="event-repeat-detail" style="display:none;">
+					<div class="event-repeat-row">
+						<span>Every</span>
+						<input type="number" class="event-form-input event-repeat-num" id="event-repeat-interval"
+							min="1" max="365" value="1" aria-label="Repeat every">
+						<span id="event-repeat-unit">weeks</span>
+					</div>
+					<div class="event-repeat-days" id="event-repeat-days" style="display:none;">
+						<label><input type="checkbox" value="MO"><span>Mon</span></label>
+						<label><input type="checkbox" value="TU"><span>Tue</span></label>
+						<label><input type="checkbox" value="WE"><span>Wed</span></label>
+						<label><input type="checkbox" value="TH"><span>Thu</span></label>
+						<label><input type="checkbox" value="FR"><span>Fri</span></label>
+						<label><input type="checkbox" value="SA"><span>Sat</span></label>
+						<label><input type="checkbox" value="SU"><span>Sun</span></label>
+					</div>
+					<div class="event-repeat-row">
+						<span>Ends</span>
+						<select class="event-form-select event-repeat-end" id="event-repeat-end">
+							<option value="">Never</option>
+							<option value="count">After</option>
+							<option value="until">On date</option>
+						</select>
+						<input type="number" class="event-form-input event-repeat-num" id="event-repeat-count"
+							min="1" max="1000" value="10" style="display:none;" aria-label="Number of occurrences">
+						<span id="event-repeat-count-unit" style="display:none;">times</span>
+						<input type="date" class="event-form-input event-repeat-until" id="event-repeat-until"
+							style="display:none;" aria-label="Repeat until">
+					</div>
+					<small class="event-field-hint" id="event-repeat-hint"></small>
 				</div>
 				<div class="event-form-group">
 					<label class="event-form-label" for="event-location">📍 Location</label>
@@ -409,6 +463,17 @@ cal.innerHTML = `
 			toggleTimeInputs(e.target.checked);
 		});
 
+		// Repeat controls: every one of them changes what the rule will say,
+		// so every one of them redraws the rest of the row and the summary.
+		['', 'interval', 'end', 'count', 'until'].forEach(id => {
+			const el = repeatEl(id);
+			if (el) {
+				el.addEventListener('change', refreshRepeatUi);
+				el.addEventListener('input', refreshRepeatUi);
+			}
+		});
+		repeatDayBoxes().forEach(box => box.addEventListener('change', refreshRepeatUi));
+
 		// Modal close buttons (override inline onclick)
 		const closeBtn = document.querySelector('.event-modal-close');
 		if (closeBtn) {
@@ -510,6 +575,12 @@ function openEventModal(eventData = null, fcEvent = null) {
 		
 		// Toggle time inputs based on allDay (this will set the input type correctly)
 		toggleTimeInputs(isAllDay);
+
+		// How it repeats, read back from the master's rule. Weekly rules need
+		// the occurrence's own start to work out which weekdays those were.
+		loadRepeatFields(eventData.rrule || '', new Date(eventData.start), isAllDay);
+		const deleteLabel = (eventData.rrule || '').trim() ? 'Delete series' : 'Delete';
+		if (deleteBtn) deleteBtn.textContent = deleteLabel;
 	} else {
 		// New event mode - default to timed event (not all-day) so time picker is visible
 		modalTitle.textContent = 'New Event';
@@ -519,6 +590,7 @@ function openEventModal(eventData = null, fcEvent = null) {
 		const orgRowNew = document.getElementById('event-organizer-row');
 		if (orgRowNew) orgRowNew.style.display = 'none';
 		document.getElementById('event-form').reset();
+		resetRepeatFields();
 		currentEventGeo = '';
 		const now = new Date();
 		const end = new Date(now.getTime() + 3600000); // 1 hour later
@@ -638,7 +710,10 @@ function saveEventFromModal() {
 		geo: currentEventGeo,
 		description,
 		reminder: parseInt(reminder) || 0,
-		attendees: attendees
+		attendees: attendees,
+		// null when the stored rule is beyond what these controls can show, so
+		// the server leaves it exactly as another client wrote it.
+		repeat: repeatPayload(startDate, allDay)
 	};
 
 	if (currentEditingEvent) {
@@ -652,7 +727,7 @@ function saveEventFromModal() {
 		currentEditingEvent.setExtendedProp('conference', eventData.conference || '');
 		currentEditingEvent.setExtendedProp('geo', eventData.geo || '');
 		currentEditingEvent.setExtendedProp('description', eventData.description || '');
-		updateEvent(currentEditingEvent);
+		updateEvent(currentEditingEvent, eventData.repeat);
 	} else {
 		// Create new event
 		createEvent(eventData);
@@ -742,6 +817,183 @@ let calFeatures = { conference: false, places: false };
 // Coordinates for whatever is in the location field, when the picker put it
 // there. Kept out of the DOM so hand-typing the field can drop it.
 let currentEventGeo = '';
+
+/* ------------------------------------------------------------------ *
+ * Recurrence
+ *
+ * The dialog collects an RRULE in pieces - how often, how far apart, which
+ * weekdays, when it stops - and the server assembles the rule from them.
+ * Nothing here ever sends a rule string: an RRULE goes straight into the
+ * ICS body, so building it out of named fields keeps that line ours.
+ * ------------------------------------------------------------------ */
+const DAY_TOKENS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+const REPEAT_UNITS = { DAILY: 'days', WEEKLY: 'weeks', MONTHLY: 'months', YEARLY: 'years' };
+const DAY_LABELS = { SU: 'Sun', MO: 'Mon', TU: 'Tue', WE: 'Wed', TH: 'Thu', FR: 'Fri', SA: 'Sat' };
+
+// True when the event carries a rule the dialog cannot show, so saving must
+// not touch it. See loadRepeatFields().
+let unsupportedRepeat = false;
+
+function repeatEl(id) {
+	return document.getElementById('event-repeat' + (id ? '-' + id : ''));
+}
+
+function repeatDayBoxes() {
+	const days = repeatEl('days');
+	return days ? Array.from(days.querySelectorAll('input[type=checkbox]')) : [];
+}
+
+// Timed events are stored in UTC, where a late-evening or small-hours meeting
+// can sit on a different weekday than the one the organiser ticked. Each tick
+// is therefore translated to the UTC weekday its first occurrence lands on -
+// otherwise a "every Monday" series repeats a day out, or picks up a stray
+// occurrence on the start date because that date is not in its own rule.
+function shiftDayTokens(tokens, startDate, allDay, toUtc) {
+	if (allDay || !startDate) return tokens;
+	return tokens.map(token => {
+		const want = DAY_TOKENS.indexOf(token);
+		if (0 > want) return token;
+		const d = new Date(startDate.getTime());
+		if (toUtc) {
+			d.setDate(d.getDate() + ((want - d.getDay() + 7) % 7));
+			return DAY_TOKENS[d.getUTCDay()];
+		}
+		d.setUTCDate(d.getUTCDate() + ((want - d.getUTCDay() + 7) % 7));
+		return DAY_TOKENS[d.getDay()];
+	});
+}
+
+// "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=20260901T235959Z" -> the fields.
+function parseRRule(rule) {
+	const out = { freq: '', interval: 1, days: [], end: '', count: 10, until: '' };
+	(rule || '').split(';').forEach(part => {
+		const eq = part.indexOf('=');
+		if (0 > eq) return;
+		const key = part.slice(0, eq).trim().toUpperCase();
+		const value = part.slice(eq + 1).trim();
+		if ('FREQ' === key) out.freq = value.toUpperCase();
+		else if ('INTERVAL' === key) out.interval = Math.max(1, parseInt(value, 10) || 1);
+		else if ('BYDAY' === key) {
+			// Positional forms such as "2MO" mean the second Monday of the
+			// month, which this dialog cannot express; leaving them unticked
+			// would silently rewrite the series, so they are read as unknown.
+			out.days = value.toUpperCase().split(',')
+				.map(d => d.trim()).filter(d => -1 !== DAY_TOKENS.indexOf(d));
+			if (out.days.length !== value.split(',').length) out.freq = '';
+		}
+		else if ('COUNT' === key) { out.end = 'count'; out.count = Math.max(1, parseInt(value, 10) || 1); }
+		else if ('UNTIL' === key) {
+			const m = value.match(/^(\d{4})(\d{2})(\d{2})/);
+			if (m) { out.end = 'until'; out.until = m[1] + '-' + m[2] + '-' + m[3]; }
+		}
+		else if ('BYSETPOS' === key || 'BYMONTHDAY' === key || 'BYMONTH' === key
+			|| 'BYWEEKNO' === key || 'BYYEARDAY' === key) out.freq = '';
+	});
+	if (-1 === ['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].indexOf(out.freq)) out.freq = '';
+	return out;
+}
+
+// Fill the repeat controls from a stored rule. `startDate` is the occurrence
+// the dialog was opened on, needed to read BYDAY back into local weekdays.
+function loadRepeatFields(rule, startDate, allDay) {
+	const parsed = parseRRule(rule);
+	const freq = repeatEl('');
+	if (!freq) return;
+
+	// A rule this dialog cannot express is left alone rather than mangled: the
+	// select stays on "Does not repeat" and, because the Repeat field is then
+	// suppressed on save, the stored rule survives untouched.
+	unsupportedRepeat = !!(rule || '').trim() && !parsed.freq;
+
+	freq.value = parsed.freq;
+	repeatEl('interval').value = parsed.interval;
+	repeatEl('end').value = parsed.end;
+	repeatEl('count').value = parsed.count;
+	repeatEl('until').value = parsed.until;
+	const wanted = shiftDayTokens(parsed.days, startDate, allDay, false);
+	repeatDayBoxes().forEach(box => { box.checked = -1 !== wanted.indexOf(box.value); });
+	refreshRepeatUi();
+}
+
+function resetRepeatFields() {
+	unsupportedRepeat = false;
+	const freq = repeatEl('');
+	if (!freq) return;
+	freq.value = '';
+	repeatEl('interval').value = 1;
+	repeatEl('end').value = '';
+	repeatEl('count').value = 10;
+	repeatEl('until').value = '';
+	repeatDayBoxes().forEach(box => { box.checked = false; });
+	refreshRepeatUi();
+}
+
+function refreshRepeatUi() {
+	const freq = repeatEl('');
+	if (!freq) return;
+	const detail = repeatEl('detail');
+	const on = !!freq.value;
+
+	if (detail) detail.style.display = on ? 'block' : 'none';
+	const unit = repeatEl('unit');
+	if (unit) unit.textContent = REPEAT_UNITS[freq.value] || '';
+	const days = repeatEl('days');
+	if (days) days.style.display = 'WEEKLY' === freq.value ? 'flex' : 'none';
+
+	const end = repeatEl('end').value;
+	repeatEl('count').style.display = 'count' === end ? 'inline-block' : 'none';
+	repeatEl('count-unit').style.display = 'count' === end ? 'inline' : 'none';
+	repeatEl('until').style.display = 'until' === end ? 'inline-block' : 'none';
+
+	const hint = repeatEl('hint');
+	if (hint) {
+		hint.textContent = on ? describeRepeat() : '';
+		hint.style.display = on ? 'block' : 'none';
+	}
+}
+
+// What the rule will actually do, in words, so nobody has to save it to find
+// out. Says nothing the fields do not already say - it just says it plainly.
+function describeRepeat() {
+	const freq = repeatEl('').value;
+	if (!freq) return '';
+	const every = Math.max(1, parseInt(repeatEl('interval').value, 10) || 1);
+	const unit = REPEAT_UNITS[freq] || '';
+	let text = 1 === every
+		? 'Repeats ' + { DAILY: 'daily', WEEKLY: 'weekly', MONTHLY: 'monthly', YEARLY: 'yearly' }[freq]
+		: 'Repeats every ' + every + ' ' + unit;
+
+	if ('WEEKLY' === freq) {
+		const picked = repeatDayBoxes().filter(b => b.checked).map(b => DAY_LABELS[b.value]);
+		if (picked.length) text += ' on ' + picked.join(', ');
+	}
+
+	const end = repeatEl('end').value;
+	if ('count' === end) {
+		const n = Math.max(1, parseInt(repeatEl('count').value, 10) || 1);
+		text += ', ' + n + (1 === n ? ' time' : ' times');
+	} else if ('until' === end && repeatEl('until').value) {
+		text += ', until ' + repeatEl('until').value;
+	}
+	return text + '. Editing or deleting it here affects the whole series.';
+}
+
+// The repeat fields as the server wants them, or null when nothing about the
+// recurrence should be written - which is not the same as "does not repeat".
+function repeatPayload(startDate, allDay) {
+	if (unsupportedRepeat) return null;
+	const freq = repeatEl('');
+	if (!freq) return null;
+	const picked = repeatDayBoxes().filter(b => b.checked).map(b => b.value);
+	return {
+		Repeat: freq.value,
+		RepeatInterval: Math.max(1, parseInt(repeatEl('interval').value, 10) || 1),
+		RepeatDays: shiftDayTokens(picked, startDate, allDay, true).join(','),
+		RepeatEnd: repeatEl('end').value,
+		RepeatCount: Math.max(1, parseInt(repeatEl('count').value, 10) || 1),
+		RepeatUntil: repeatEl('until').value
+	};
+}
 
 function applyFeatureToggles() {
 	const confBtn = document.getElementById('event-conference-btn');
@@ -996,6 +1248,7 @@ eventClick: function(info) {
 		geo: event.extendedProps?.geo || '',
 		description: event.extendedProps?.description || '',
 		reminder: event.extendedProps?.reminder || '',
+		rrule: event.extendedProps?.rrule || '',
 		attendees: event.extendedProps?.attendees || '',
 		organizer: event.extendedProps?.organizer || '',
 		isOrganizer: false !== event.extendedProps?.isOrganizer
@@ -1057,6 +1310,11 @@ return;
 			textColor: 'var(--cal-event-text)',
 			classNames: ['modern-event'],
 			extendedProps: {
+				// The series rule, and where in the series this instance sits.
+				// Both belong to the stored master, not to the copy the grid
+				// draws, so an edit here can be applied to the series.
+				rrule: event.rrule || '',
+				instanceStart: event.dtstart || event.start || '',
 				location: event.location || '',
 				conference: event.conference || '',
 				geo: event.geo || '',
@@ -1197,7 +1455,9 @@ function createEvent(eventData) {
 		// minutes before start; the server turns this into a real VALARM
 		Reminder: eventData.reminder || 0,
 		// comma or semicolon separated; the calendar server mails the invitations
-		Attendees: eventData.attendees || ''
+		Attendees: eventData.attendees || '',
+		// how it repeats; the server assembles the RRULE from these
+		...(eventData.repeat || {})
 	});
 }
 
@@ -1209,8 +1469,10 @@ function formatDateOnly(date) {
 	return `${year}-${month}-${day}`;
 }
 
-function updateEvent(event) {
-	
+// `repeat` comes from the dialog only. Dragging or resizing in the grid calls
+// this without it, so the stored rule is left alone.
+function updateEvent(event, repeat) {
+
 	if (!rl.pluginRemoteRequest) return;
 	
 	const eventId = event.id || event.extendedProps?.uid;
@@ -1245,11 +1507,16 @@ function updateEvent(event) {
 		Conference: event.extendedProps?.conference,
 		Geo: event.extendedProps?.geo,
 		Description: event.extendedProps?.description,
+		// Which occurrence of a series this was before it was touched. The
+		// server shifts the whole series by the difference rather than moving
+		// it onto this one date.
+		RecurrenceId: event.extendedProps?.instanceStart,
 		EventId: eventId,
 		Title: event.title,
 		Start: startFormatted,
 		End: endFormatted,
-		AllDay: event.allDay || false
+		AllDay: event.allDay || false,
+		...(repeat || {})
 	});
 }
 
