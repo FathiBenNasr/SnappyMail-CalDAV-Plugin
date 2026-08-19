@@ -2,3 +2,11 @@
 # ../packaging/dist, which also writes the catalogue manifest. A second copy
 # here is how the manifest came to advertise tarballs that no longer existed.
 dist/
+
+# Business, platform and infrastructure notes live in the private
+# snappymail-workspace repo. This one is public: nothing here may describe
+# customers, pricing, hostnames or the directory layout.
+PLATFORM.md
+TODO.md
+VJOURNAL-PROMPT.md
+docs/ADMIN-CONSOLE-PLAN.md
