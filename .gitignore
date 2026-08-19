@@ -1,0 +1,4 @@
+# Packages are built by the shared ../packaging/build.sh into
+# ../packaging/dist, which also writes the catalogue manifest. A second copy
+# here is how the manifest came to advertise tarballs that no longer existed.
+dist/
