@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.15',
+		VERSION  = '2.16',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -27,6 +27,8 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('CreateCalendar', 'DoCreateCalendar');
 		$this->addJsonHook('UpdateCalendar', 'DoUpdateCalendar');
 		$this->addJsonHook('QueryFreeBusy', 'DoQueryFreeBusy');
+		$this->addJsonHook('GetAvailability', 'DoGetAvailability');
+		$this->addJsonHook('SaveAvailability', 'DoSaveAvailability');
 		$this->addJsonHook('GetTasks', 'DoGetTasks');
 		$this->addJsonHook('SaveTask', 'DoSaveTask');
 		$this->addJsonHook('DeleteTask', 'DoDeleteTask');
@@ -2884,6 +2886,277 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			}
 		}
 		return \rtrim($aConfig['CalDAVUrl'], '/') . '/Outbox/';
+	}
+
+	/**
+	 * The scheduling Inbox, where the account's own availability is kept.
+	 */
+	private function scheduleInboxUrl(array $aConfig, string $sPassword) : string
+	{
+		$sBody = '<?xml version="1.0" encoding="utf-8" ?>'
+			. '<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+			. '<D:prop><D:resourcetype /></D:prop></D:propfind>';
+		$aResult = $this->makeCalDAVRequest(\rtrim($aConfig['CalDAVUrl'], '/') . '/', 'PROPFIND',
+			$aConfig['User'], $sPassword, $sBody,
+			['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+
+		if (207 === (int) $aResult['code']) {
+			$oDoc = $this->loadDavXml((string) $aResult['body']);
+			if ($oDoc) {
+				$oXPath = new \DOMXPath($oDoc);
+				$oXPath->registerNamespace('D', 'DAV:');
+				$oXPath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');
+				foreach ($oXPath->query('//D:response') as $oResponse) {
+					if ($oXPath->query('.//D:resourcetype/C:schedule-inbox', $oResponse)->length) {
+						$sHref = \trim((string) ($oXPath->query('./D:href', $oResponse)->item(0)->nodeValue ?? ''));
+						if (\strlen($sHref)) {
+							return $this->absoluteDavUrl($aConfig['CalDAVUrl'], $sHref);
+						}
+					}
+				}
+			}
+		}
+		return \rtrim($aConfig['CalDAVUrl'], '/') . '/Inbox/';
+	}
+
+	/**
+	 * Office hours out of a VAVAILABILITY (RFC 7953), as the one weekly shape
+	 * this dialog can show: some weekdays, one start, one end.
+	 *
+	 * The standard allows far more than that - overlapping AVAILABLE blocks,
+	 * different hours per day, priorities, date ranges. Anything beyond one
+	 * weekly pattern is reported as unknown rather than flattened, on the same
+	 * rule the recurrence dialog follows: a shape shown wrongly gets rewritten
+	 * the moment anything else is saved.
+	 */
+	private function parseAvailability(string $sIcs) : array
+	{
+		$aNone = array('known' => false, 'set' => false, 'days' => array(),
+			'start' => '', 'end' => '', 'timezone' => '');
+		if (!\strlen(\trim($sIcs))) {
+			return $aNone;
+		}
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sIcs, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VAVAILABILITY)) {
+				return $aNone;
+			}
+			$aBlocks = array();
+			foreach ($oVCal->VAVAILABILITY as $oAvail) {
+				if (!isset($oAvail->AVAILABLE)) {
+					continue;
+				}
+				foreach ($oAvail->AVAILABLE as $oBlock) {
+					$aBlocks[] = $oBlock;
+				}
+			}
+			// One block, or none. Two different blocks are two different
+			// patterns and this cannot draw them.
+			if (1 !== \count($aBlocks)) {
+				return array('known' => false, 'set' => (bool) \count($aBlocks),
+					'days' => array(), 'start' => '', 'end' => '', 'timezone' => '');
+			}
+
+			$oBlock = $aBlocks[0];
+			if (!isset($oBlock->DTSTART) || !isset($oBlock->RRULE)) {
+				return array('known' => false, 'set' => true, 'days' => array(),
+					'start' => '', 'end' => '', 'timezone' => '');
+			}
+			$aParts = $oBlock->RRULE->getParts();
+			if ('WEEKLY' !== \strtoupper((string) ($aParts['FREQ'] ?? ''))
+			 || 1 < (int) ($aParts['INTERVAL'] ?? 1)
+			 || isset($aParts['COUNT']) || isset($aParts['UNTIL'])
+			 || isset($aParts['BYSETPOS']) || isset($aParts['BYMONTHDAY'])) {
+				return array('known' => false, 'set' => true, 'days' => array(),
+					'start' => '', 'end' => '', 'timezone' => '');
+			}
+
+			$oStart = $oBlock->DTSTART->getDateTime();
+
+			$aDays = array();
+			$aByDay = (array) ($aParts['BYDAY'] ?? array());
+			foreach ($aByDay as $sDay) {
+				$sDay = \strtoupper(\trim((string) $sDay));
+				// A positional day - "2MO", the second Monday - is a shape this
+				// cannot show, and reading it as plain Monday would move
+				// somebody's office hours on saving.
+				if (!\in_array($sDay, self::RRULE_DAYS, true)) {
+					return array('known' => false, 'set' => true, 'days' => array(),
+						'start' => '', 'end' => '', 'timezone' => '');
+				}
+				$aDays[] = $sDay;
+			}
+			if (!$aDays) {
+				// A weekly rule with no BYDAY repeats on the weekday its start
+				// falls on (RFC 5545 3.3.10), which is one day and not seven.
+				$aDays = array(self::RRULE_DAYS[(int) $oStart->format('w')]);
+			}
+			$oEnd = isset($oBlock->DTEND)
+				? $oBlock->DTEND->getDateTime()
+				: (isset($oBlock->DURATION)
+					? (clone $oStart)->add(\Sabre\VObject\DateTimeParser::parseDuration((string) $oBlock->DURATION))
+					: null);
+			if (!$oEnd) {
+				return array('known' => false, 'set' => true, 'days' => array(),
+					'start' => '', 'end' => '', 'timezone' => '');
+			}
+
+			return array(
+				'known'    => true,
+				'set'      => true,
+				'days'     => $aDays ?: self::RRULE_DAYS,
+				'start'    => $oStart->format('H:i'),
+				'end'      => $oEnd->format('H:i'),
+				'timezone' => (string) ($oBlock->DTSTART['TZID'] ?? '')
+			);
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'availability parse failed: ' . $oException->getMessage());
+			return $aNone;
+		}
+	}
+
+	/**
+	 * A VAVAILABILITY for one weekly pattern of office hours.
+	 *
+	 * Written in the account's own timezone rather than UTC: office hours are
+	 * wall-clock facts - nine in the morning stays nine after a daylight-saving
+	 * change - and stating them as an instant would move them twice a year.
+	 */
+	private function buildAvailability(array $aDays, string $sStart, string $sEnd, string $sZone) : string
+	{
+		$aClean = array();
+		foreach ($aDays as $sDay) {
+			$sDay = \strtoupper(\trim((string) $sDay));
+			if (\in_array($sDay, self::RRULE_DAYS, true) && !\in_array($sDay, $aClean, true)) {
+				$aClean[] = $sDay;
+			}
+		}
+		if (!$aClean || !\preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $sStart)
+		 || !\preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $sEnd) || $sEnd <= $sStart) {
+			return '';
+		}
+		try {
+			$oZone = new \DateTimeZone(\strlen($sZone) ? $sZone : 'UTC');
+		} catch (\Throwable $oException) {
+			$oZone = new \DateTimeZone('UTC');
+		}
+
+		// The pattern has to start on a day it applies to, or the first week is
+		// wrong; the Monday of the current week is as good a anchor as any.
+		$oAnchor = new \DateTime('monday this week', $oZone);
+		$sDate = $oAnchor->format('Ymd');
+		$sTzid = ';TZID=' . $oZone->getName();
+
+		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+			. "PRODID:-//SnappyMail//CalDAV Plugin//EN\r\n"
+			. "BEGIN:VAVAILABILITY\r\n"
+			. 'UID:' . \uniqid('avail-') . "@snappymail\r\n"
+			. 'DTSTAMP:' . \gmdate('Ymd\THis\Z') . "\r\n"
+			. "BEGIN:AVAILABLE\r\n"
+			. 'UID:' . \uniqid('avail-block-') . "@snappymail\r\n"
+			. 'DTSTAMP:' . \gmdate('Ymd\THis\Z') . "\r\n"
+			. 'DTSTART' . $sTzid . ':' . $sDate . 'T' . \str_replace(':', '', $sStart) . "00\r\n"
+			. 'DTEND' . $sTzid . ':' . $sDate . 'T' . \str_replace(':', '', $sEnd) . "00\r\n"
+			. 'RRULE:FREQ=WEEKLY;BYDAY=' . \implode(',', $aClean) . "\r\n"
+			. "SUMMARY:Office hours\r\n"
+			. "END:AVAILABLE\r\n"
+			. "END:VAVAILABILITY\r\nEND:VCALENDAR\r\n";
+	}
+
+	/**
+	 * The account's office hours, as the server holds them.
+	 */
+	public function DoGetAvailability() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			$sPassword = $aConfig ? $this->calendarPassword($aConfig) : null;
+			if (!$aConfig || null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false,
+					'error' => 'Calendar not configured']);
+			}
+
+			$sBody = '<?xml version="1.0" encoding="utf-8" ?>'
+				. '<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+				. '<D:prop><C:calendar-availability /></D:prop></D:propfind>';
+			$aResult = $this->makeCalDAVRequest($this->scheduleInboxUrl($aConfig, $sPassword),
+				'PROPFIND', $aConfig['User'], $sPassword, $sBody,
+				['Content-Type: application/xml; charset=utf-8', 'Depth: 0']);
+
+			$sIcs = '';
+			if (207 === (int) $aResult['code']) {
+				$oDoc = $this->loadDavXml((string) $aResult['body']);
+				if ($oDoc) {
+					$oXPath = new \DOMXPath($oDoc);
+					$oXPath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');
+					$sIcs = (string) ($oXPath->query('//C:calendar-availability')->item(0)->nodeValue ?? '');
+				}
+			}
+			return $this->jsonResponse(__FUNCTION__,
+				array('success' => true) + $this->parseAvailability($sIcs));
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
+	}
+
+	/**
+	 * Set or clear the account's office hours.
+	 */
+	public function DoSaveAvailability() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			$sPassword = $aConfig ? $this->calendarPassword($aConfig) : null;
+			if (!$aConfig || null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false,
+					'error' => 'Calendar not configured']);
+			}
+
+			$aDays = \preg_split('/[\s,;]+/', (string) $this->jsonParam('Days', ''), -1, PREG_SPLIT_NO_EMPTY) ?: array();
+			$sIcs = $this->buildAvailability($aDays,
+				\trim((string) $this->jsonParam('Start', '')),
+				\trim((string) $this->jsonParam('End', '')),
+				\trim((string) $this->jsonParam('Timezone', '')));
+
+			// No days, or unusable hours, means "I do not keep office hours" -
+			// which is cleared rather than refused.
+			$sXml = '<?xml version="1.0" encoding="utf-8" ?>'
+				. '<D:propertyupdate xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+				. (\strlen($sIcs)
+					? '<D:set><D:prop><C:calendar-availability>'
+						. \htmlspecialchars($sIcs, ENT_XML1 | ENT_QUOTES, 'UTF-8')
+						. '</C:calendar-availability></D:prop></D:set>'
+					: '<D:remove><D:prop><C:calendar-availability /></D:prop></D:remove>')
+				. '</D:propertyupdate>';
+
+			$aResult = $this->makeCalDAVRequest($this->scheduleInboxUrl($aConfig, $sPassword),
+				'PROPPATCH', $aConfig['User'], $sPassword, $sXml,
+				['Content-Type: application/xml; charset=utf-8']);
+
+			$bOk = \in_array((int) $aResult['code'], array(200, 204), true);
+			if (207 === (int) $aResult['code']) {
+				$bOk = true;
+				$oDoc = $this->loadDavXml((string) $aResult['body']);
+				if ($oDoc) {
+					$oXPath = new \DOMXPath($oDoc);
+					$oXPath->registerNamespace('D', 'DAV:');
+					foreach ($oXPath->query('//D:propstat/D:status') as $oStatus) {
+						if (!\preg_match('# 2\d\d #', ' ' . \trim((string) $oStatus->nodeValue) . ' ')) {
+							$bOk = false;
+						}
+					}
+				}
+			}
+			return $this->jsonResponse(__FUNCTION__, $bOk
+				? ['success' => true, 'cleared' => !\strlen($sIcs)]
+				: ['success' => false,
+					'error' => 'The server would not store office hours (' . $aResult['code']
+						. '). It may not support RFC 7953.']);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'error' => $oException->getMessage()]);
+		}
 	}
 
 	/**

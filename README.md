@@ -219,6 +219,28 @@ people are choosing between; twenty-four hours of mostly empty bar makes the
 hours that matter unreadable. Suggestions land on the quarter hour, so they
 read as 09:00 and 09:15 rather than 09:07.
 
+### Office hours
+
+The Calendars panel has an **Office hours** row — some weekdays, a start and an
+end. It is stored on the server as a `VAVAILABILITY`
+([RFC 7953](https://www.rfc-editor.org/rfc/rfc7953)) on the scheduling Inbox, so
+it is the account's own property and not a setting in one browser.
+
+It narrows the day the availability view draws and the times it suggests. A day
+outside them is still drawn — so it can be seen to be empty and chosen anyway —
+but nothing is proposed on it, because a feature that offers Sunday evening is
+one people stop reading.
+
+The hours are written **in a timezone, never as an instant**. Office hours are a
+wall-clock fact: nine in the morning is still nine after a daylight-saving
+change, and storing them as a moment would move them twice a year.
+
+`VAVAILABILITY` allows far more than one weekly pattern — overlapping blocks,
+different hours per day, priorities, date ranges. Anything beyond a single
+weekly shape is read as *unknown*: the controls say so and disable themselves
+rather than showing a version of it that is not true, and saving from this page
+cannot then flatten what another client wrote.
+
 ## Tasks
 
 A `VTODO` lives in the same collections, under the same account, as an event —

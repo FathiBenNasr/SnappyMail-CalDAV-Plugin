@@ -312,6 +312,29 @@ cal.innerHTML = `
 	<div class="calendar-new">
 		<label style="width:100%;"><input type="checkbox" id="calendar-show-tasks">
 			<span>Show tasks that are due on the grid</span></label>
+		<div style="width:100%;border-top:1px solid var(--cal-border);padding-top:10px;margin-top:4px;">
+			<div style="margin-bottom:6px;">Office hours <small style="opacity:.7"
+				id="hours-note">— when others may suggest meeting you</small></div>
+			<div class="event-repeat-days" id="hours-days">
+				<label><input type="checkbox" value="MO"><span>Mon</span></label>
+				<label><input type="checkbox" value="TU"><span>Tue</span></label>
+				<label><input type="checkbox" value="WE"><span>Wed</span></label>
+				<label><input type="checkbox" value="TH"><span>Thu</span></label>
+				<label><input type="checkbox" value="FR"><span>Fri</span></label>
+				<label><input type="checkbox" value="SA"><span>Sat</span></label>
+				<label><input type="checkbox" value="SU"><span>Sun</span></label>
+			</div>
+			<div class="event-repeat-row">
+				<span>From</span>
+				<input type="time" class="event-form-input event-repeat-num" id="hours-start"
+					style="width:110px;" value="09:00" aria-label="Office hours start">
+				<span>to</span>
+				<input type="time" class="event-form-input event-repeat-num" id="hours-end"
+					style="width:110px;" value="17:00" aria-label="Office hours end">
+				<button type="button" id="hours-save">Save</button>
+				<button type="button" id="hours-clear">Clear</button>
+			</div>
+		</div>
 		<input type="text" id="calendar-new-name" placeholder="New calendar" aria-label="New calendar name">
 		<input type="color" id="calendar-new-color" value="#00639a" aria-label="Colour">
 		<label><input type="checkbox" class="calendar-new-comp" value="VEVENT" checked><span>Events</span></label>
@@ -787,6 +810,7 @@ cal.innerHTML = `
 				const open = 'none' === panel.style.display;
 				panel.style.display = open ? 'flex' : 'none';
 				panelBtn.setAttribute('aria-expanded', String(open));
+				if (open && !officeHours) loadOfficeHours();
 			});
 		}
 		const calAdd = document.getElementById('calendar-new-add');
@@ -808,6 +832,11 @@ cal.innerHTML = `
 			freeBusyDay = new Date(freeBusyDay.getTime() + 86400000);
 			loadFreeBusy();
 		});
+
+		const hoursSave = document.getElementById('hours-save');
+		if (hoursSave) hoursSave.addEventListener('click', () => saveOfficeHours(false));
+		const hoursClear = document.getElementById('hours-clear');
+		if (hoursClear) hoursClear.addEventListener('click', () => saveOfficeHours(true));
 
 		const gridTasks = document.getElementById('calendar-show-tasks');
 		if (gridTasks) {
@@ -1616,6 +1645,74 @@ const FB_DAY_END = 20;
 const FB_SLOT_STEP_MIN = 15;
 let freeBusyDay = null;
 let freeBusyAnswer = null;
+// The account's own office hours, as the server holds them (RFC 7953). Null
+// until asked for; { known, set, days, start, end } once it has been.
+let officeHours = null;
+
+function hoursDayBoxes() {
+	return Array.from(document.querySelectorAll('#hours-days input[type="checkbox"]'));
+}
+
+function loadOfficeHours(then) {
+	if (!rl.pluginRemoteRequest) return;
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		officeHours = (res && res.success) ? res : { known: false, set: false };
+		showOfficeHours();
+		if (then) then();
+	}, 'GetAvailability', {});
+}
+
+function showOfficeHours() {
+	const note = document.getElementById('hours-note');
+	if (!officeHours || !note) return;
+
+	// A pattern beyond one weekly shape is left exactly as it stands, and the
+	// controls say so rather than showing a version of it that is not true.
+	const beyond = officeHours.set && !officeHours.known;
+	hoursDayBoxes().forEach(box => {
+		box.checked = !beyond && -1 !== (officeHours.days || []).indexOf(box.value);
+		box.disabled = beyond;
+	});
+	const startEl = document.getElementById('hours-start');
+	const endEl = document.getElementById('hours-end');
+	if (startEl) {
+		startEl.value = (!beyond && officeHours.start) || '09:00';
+		startEl.disabled = beyond;
+	}
+	if (endEl) {
+		endEl.value = (!beyond && officeHours.end) || '17:00';
+		endEl.disabled = beyond;
+	}
+	const save = document.getElementById('hours-save');
+	if (save) save.disabled = beyond;
+
+	note.textContent = beyond
+		? '— set to a pattern this page cannot show, and left as it is'
+		: (officeHours.known
+			? '— used when suggesting times to meet you'
+			: '— none set; suggestions use the whole working day');
+}
+
+function saveOfficeHours(clear) {
+	if (!rl.pluginRemoteRequest) return;
+	const days = clear ? [] : hoursDayBoxes().filter(b => b.checked).map(b => b.value);
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			alert((res && res.error) || 'Could not save your office hours.');
+			return;
+		}
+		loadOfficeHours();
+	}, 'SaveAvailability', {
+		Days: days.join(','),
+		Start: (document.getElementById('hours-start') || {}).value || '',
+		End: (document.getElementById('hours-end') || {}).value || '',
+		// The browser knows the reader's zone; office hours are wall-clock and
+		// have to be stored in one, or they move twice a year.
+		Timezone: (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC')
+	});
+}
 
 // The busy periods of everyone, merged into one list of intervals nobody is
 // available in. Overlaps are joined, so the gaps between them are exactly the
@@ -1668,12 +1765,36 @@ function freeSlots(people, from, to, durationMs, limit) {
 	return out;
 }
 
+// The stretch of a day worth drawing, and worth suggesting inside. Office
+// hours narrow it when they are set: proposing nine in the evening on a Sunday
+// is the way a "find a time" feature earns being ignored.
 function fbWindow(day) {
 	const from = new Date(day);
-	from.setHours(FB_DAY_START, 0, 0, 0);
 	const to = new Date(day);
-	to.setHours(FB_DAY_END, 0, 0, 0);
-	return { from: from, to: to };
+	let startHour = FB_DAY_START, endHour = FB_DAY_END;
+
+	if (officeHours && officeHours.known && (officeHours.days || []).length) {
+		const token = DAY_TOKENS[day.getDay()];
+		if (-1 === officeHours.days.indexOf(token)) {
+			// Not a working day at all. The day is still drawn, so somebody can
+			// see it is empty and choose it anyway, but nothing is suggested.
+			from.setHours(FB_DAY_START, 0, 0, 0);
+			to.setHours(FB_DAY_END, 0, 0, 0);
+			return { from: from, to: to, working: false };
+		}
+		const at = (hhmm, fallback) => {
+			const parts = String(hhmm || '').split(':');
+			const h = parseInt(parts[0], 10);
+			return isNaN(h) ? fallback : h + ((parseInt(parts[1], 10) || 0) / 60);
+		};
+		startHour = Math.floor(at(officeHours.start, FB_DAY_START));
+		endHour = Math.ceil(at(officeHours.end, FB_DAY_END));
+		if (endHour <= startHour) { startHour = FB_DAY_START; endHour = FB_DAY_END; }
+	}
+
+	from.setHours(startHour, 0, 0, 0);
+	to.setHours(endHour, 0, 0, 0);
+	return { from: from, to: to, working: true };
 }
 
 function openFreeBusy() {
@@ -1681,7 +1802,9 @@ function openFreeBusy() {
 	const when = new Date(startEl && startEl.value ? startEl.value : Date.now());
 	freeBusyDay = isNaN(when) ? new Date() : when;
 	document.getElementById('freebusy-modal').classList.add('show');
-    loadFreeBusy();
+	// Office hours decide the window, so they are asked for first - once per
+	// dialog, not once per day paged through.
+	if (officeHours) { loadFreeBusy(); } else { loadOfficeHours(loadFreeBusy); }
 }
 
 function loadFreeBusy() {
@@ -1724,7 +1847,7 @@ function renderFreeBusy(from, to) {
 
 	const hours = document.createElement('div');
 	hours.className = 'fb-hours';
-	for (let h = FB_DAY_START; h < FB_DAY_END; ++h) {
+	for (let h = from.getHours(); h < to.getHours(); ++h) {
 		const cell = document.createElement('span');
 		cell.textContent = String(h).padStart(2, '0');
 		hours.appendChild(cell);
@@ -1799,7 +1922,8 @@ function renderFreeBusy(from, to) {
 	}
 
 	const known = (freeBusyAnswer || []).filter(p => p.known);
-	const slots = freeSlots(known, from, to, duration, 8);
+	const working = fbWindow(freeBusyDay).working;
+	const slots = working ? freeSlots(known, from, to, duration, 8) : [];
 	const box = document.createElement('div');
 	box.className = 'fb-slots';
 	const title = document.createElement('h4');
@@ -1809,9 +1933,11 @@ function renderFreeBusy(from, to) {
 	if (!slots.length) {
 		const none = document.createElement('div');
 		none.className = 'fb-note';
-		none.textContent = known.length
-			? 'No gap this long on this day. Try another.'
-			: 'Nothing to suggest until somebody\'s calendar answers.';
+		none.textContent = !working
+			? 'Outside your office hours. The day is drawn so you can choose it anyway.'
+			: (known.length
+				? 'No gap this long on this day. Try another.'
+				: 'Nothing to suggest until somebody\'s calendar answers.');
 		box.appendChild(none);
 	}
 	slots.forEach(slot => {
