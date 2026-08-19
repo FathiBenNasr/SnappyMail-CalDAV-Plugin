@@ -186,6 +186,39 @@ different one.
 The scheduling Inbox and Outbox carry the `calendar` resourcetype too, and are
 deliberately left out: drawing them would show every invitation twice.
 
+## When is everyone free?
+
+The event dialog has a **Check availability** button beside the guest list. It
+draws a working day — 07:00 to 20:00 — with one row per invited address and a
+block wherever that person is busy, and suggests the times a meeting of this
+length fits with nobody booked. Choosing one writes it into the dialog; it
+picks a time, it does not book the meeting.
+
+This plugin never reads anybody else's calendar. Under
+[RFC 6638 §4.1](https://www.rfc-editor.org/rfc/rfc6638#section-4.1) the
+organiser posts a `VFREEBUSY` request to their own scheduling Outbox and the
+**server** asks each attendee's calendar — including ones this account has no
+access to — and answers with busy times and no event details. That is precisely
+why it is allowed to ask, and Cyrus needs the `freebusy` module and
+`caldav_allowscheduling` for it, both of which scheduling already requires.
+
+Two things it is careful about:
+
+* **An address the server could not answer for is hatched, never blank.** "We
+  could not ask" and "they are free" are different answers, and drawing them
+  the same way is how a meeting gets booked over somebody's morning. Unknown
+  addresses are also left out of the suggestions rather than counted as
+  available.
+* **Tentative busy is drawn faded**, not solid: `FBTYPE=BUSY-TENTATIVE` means
+  somebody has not committed, which is a different fact from a firm booking.
+  `FBTYPE=FREE` periods are discarded — a server that states them is saying
+  what silence already says.
+
+The day is drawn from 07:00 rather than midnight because a working day is what
+people are choosing between; twenty-four hours of mostly empty bar makes the
+hours that matter unreadable. Suggestions land on the quarter hour, so they
+read as 09:00 and 09:15 rather than 09:07.
+
 ## Tasks
 
 A `VTODO` lives in the same collections, under the same account, as an event —

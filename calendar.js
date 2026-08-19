@@ -228,6 +228,27 @@ cal.innerHTML = `
 .place-result:hover, .place-result.is-active { background: var(--cal-bg-tertiary); }
 .place-status { margin-top: 12px; font-size: 13px; opacity: .75; }
 
+/* Free/busy */
+.fb-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 13px; }
+.fb-head button { padding: 5px 10px; border: 1px solid var(--cal-border); border-radius: 6px; background: var(--cal-bg-tertiary); color: var(--cal-text-primary); cursor: pointer; }
+.fb-day { flex: 1; font-weight: 600; }
+.fb-grid { border: 1px solid var(--cal-border); border-radius: 8px; overflow: hidden; }
+.fb-hours { display: flex; padding-left: 130px; font-size: 10px; color: var(--cal-text-tertiary); border-bottom: 1px solid var(--cal-border); }
+.fb-hours span { flex: 1; padding: 3px 0 3px 3px; border-left: 1px solid var(--cal-border); }
+.fb-row { display: flex; align-items: center; border-top: 1px solid var(--cal-border); }
+.fb-row:first-child { border-top: none; }
+.fb-who { width: 130px; flex: none; padding: 7px 10px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-track { flex: 1; position: relative; height: 30px; background: repeating-linear-gradient(to right, transparent, transparent calc(100%/13 - 1px), var(--cal-border) calc(100%/13 - 1px), var(--cal-border) calc(100%/13)); }
+.fb-busy { position: absolute; top: 6px; bottom: 6px; background: var(--cal-accent); border-radius: 3px; opacity: .85; }
+.fb-busy.is-tentative { opacity: .45; }
+.fb-unknown { position: absolute; inset: 6px 0; background: repeating-linear-gradient(45deg, var(--cal-border), var(--cal-border) 4px, transparent 4px, transparent 8px); border-radius: 3px; }
+.fb-now { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--cal-danger); }
+.fb-slots { margin-top: 14px; }
+.fb-slots h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--cal-text-tertiary); }
+.fb-slot { display: inline-block; margin: 0 6px 6px 0; padding: 6px 11px; border: 1px solid var(--cal-border); border-radius: 999px; background: var(--cal-bg-primary); color: var(--cal-text-primary); font-size: 13px; cursor: pointer; }
+.fb-slot:hover { border-color: var(--cal-accent); background: var(--cal-accent-light); }
+.fb-note { font-size: 12px; color: var(--cal-text-secondary); margin-top: 10px; }
+
 /* Tasks */
 .cal-tasks { position: absolute; top: 0; right: 0; bottom: 0; width: 380px; max-width: 100%; background: var(--cal-bg-primary); border-left: 1px solid var(--cal-border); box-shadow: -2px 0 12px var(--cal-shadow); display: flex; flex-direction: column; z-index: 5; }
 .cal-tasks-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--cal-border); }
@@ -459,6 +480,8 @@ cal.innerHTML = `
 					<input type="text" class="event-form-input" id="event-attendees" placeholder="email@example.com, another@example.com">
 					<small style="opacity:.7">Invitations are sent by the calendar server once the event is saved.</small>
 					<div class="event-guests" id="event-guests"></div>
+					<button type="button" class="event-modal-btn event-modal-btn-secondary"
+						id="event-freebusy-btn" style="margin-top:8px;">Check availability</button>
 				</div>
 				<div class="event-form-group">
 					<label class="event-form-label">Description</label>
@@ -484,6 +507,26 @@ cal.innerHTML = `
 			<button class="event-modal-btn event-modal-btn-warning" id="event-cancel-meeting-btn" style="display:none;" title="Tell the guests it is off, then remove it">Cancel meeting</button>
 			<button class="event-modal-btn event-modal-btn-secondary" id="event-cancel-btn">Cancel</button>
 			<button class="event-modal-btn event-modal-btn-primary" id="event-save-btn">Save Event</button>
+		</div>
+	</div>
+</div>
+
+<div class="event-modal-overlay" id="freebusy-modal">
+	<div class="event-modal">
+		<div class="event-modal-header">
+			<h2 class="event-modal-title">When is everyone free?</h2>
+			<button class="event-modal-close" id="freebusy-close">×</button>
+		</div>
+		<div class="event-modal-body">
+			<div class="fb-head">
+				<button type="button" id="freebusy-prev" aria-label="Previous day">‹</button>
+				<span class="fb-day" id="freebusy-day"></span>
+				<button type="button" id="freebusy-next" aria-label="Next day">›</button>
+			</div>
+			<div id="freebusy-body"></div>
+		</div>
+		<div class="event-modal-footer">
+			<button class="event-modal-btn event-modal-btn-secondary" id="freebusy-cancel">Close</button>
 		</div>
 	</div>
 </div>
@@ -748,6 +791,24 @@ cal.innerHTML = `
 		}
 		const calAdd = document.getElementById('calendar-new-add');
 		if (calAdd) calAdd.addEventListener('click', addCalendar);
+		const fbBtn = document.getElementById('event-freebusy-btn');
+		if (fbBtn) fbBtn.addEventListener('click', openFreeBusy);
+		['freebusy-close', 'freebusy-cancel'].forEach(id => {
+			const el = document.getElementById(id);
+			if (el) el.addEventListener('click', () =>
+				document.getElementById('freebusy-modal').classList.remove('show'));
+		});
+		const fbPrev = document.getElementById('freebusy-prev');
+		if (fbPrev) fbPrev.addEventListener('click', () => {
+			freeBusyDay = new Date(freeBusyDay.getTime() - 86400000);
+			loadFreeBusy();
+		});
+		const fbNext = document.getElementById('freebusy-next');
+		if (fbNext) fbNext.addEventListener('click', () => {
+			freeBusyDay = new Date(freeBusyDay.getTime() + 86400000);
+			loadFreeBusy();
+		});
+
 		const gridTasks = document.getElementById('calendar-show-tasks');
 		if (gridTasks) {
 			gridTasks.checked = tasksOnGrid();
@@ -1536,6 +1597,258 @@ function repeatPayload(startDate, allDay) {
 		RepeatCount: Math.max(1, parseInt(repeatEl('count').value, 10) || 1),
 		RepeatUntil: repeatEl('until').value
 	};
+}
+
+/* ------------------------------------------------------------------ *
+ * Free/busy — when is everyone free?
+ *
+ * The server answers this, not us: an RFC 6638 scheduling request asks
+ * every attendee's calendar, including ones this account cannot read, and
+ * gets back busy times without any event details. Nothing here sees
+ * anybody else's appointments, which is exactly why it is allowed to ask.
+ *
+ * The day is drawn from FB_DAY_START to FB_DAY_END rather than midnight to
+ * midnight: a working day is what people are choosing between, and 24
+ * hours of mostly-empty bar makes the hours that matter unreadable.
+ * ------------------------------------------------------------------ */
+const FB_DAY_START = 7;
+const FB_DAY_END = 20;
+const FB_SLOT_STEP_MIN = 15;
+let freeBusyDay = null;
+let freeBusyAnswer = null;
+
+// The busy periods of everyone, merged into one list of intervals nobody is
+// available in. Overlaps are joined, so the gaps between them are exactly the
+// times every single person is free.
+function mergeBusy(people, from, to) {
+	const spans = [];
+	(people || []).forEach(person => {
+		(person.periods || []).forEach(period => {
+			const start = new Date(period.start), end = new Date(period.end);
+			if (isNaN(start) || isNaN(end) || end <= from || start >= to) return;
+			spans.push([Math.max(start.getTime(), from.getTime()),
+				Math.min(end.getTime(), to.getTime())]);
+		});
+	});
+	spans.sort((a, b) => a[0] - b[0]);
+
+	const merged = [];
+	spans.forEach(span => {
+		const last = merged[merged.length - 1];
+		if (last && span[0] <= last[1]) {
+			last[1] = Math.max(last[1], span[1]);
+		} else {
+			merged.push(span.slice());
+		}
+	});
+	return merged;
+}
+
+// Every start time, on a quarter hour, where a meeting of this length fits
+// with nobody busy. Returns times, not spans: the caller knows the duration.
+function freeSlots(people, from, to, durationMs, limit) {
+	const busy = mergeBusy(people, from, to);
+	const step = FB_SLOT_STEP_MIN * 60000;
+	const out = [];
+
+	// Start on the next step boundary, so suggestions read as 09:00 and 09:15
+	// rather than 09:07.
+	let at = Math.ceil(from.getTime() / step) * step;
+	const end = to.getTime();
+	while (at + durationMs <= end && out.length < (limit || 8)) {
+		const clash = busy.find(span => at < span[1] && (at + durationMs) > span[0]);
+		if (clash) {
+			// Jump to the end of whatever is in the way rather than crawling.
+			at = Math.ceil(clash[1] / step) * step;
+			continue;
+		}
+		out.push(new Date(at));
+		at += step;
+	}
+	return out;
+}
+
+function fbWindow(day) {
+	const from = new Date(day);
+	from.setHours(FB_DAY_START, 0, 0, 0);
+	const to = new Date(day);
+	to.setHours(FB_DAY_END, 0, 0, 0);
+	return { from: from, to: to };
+}
+
+function openFreeBusy() {
+	const startEl = document.getElementById('event-start');
+	const when = new Date(startEl && startEl.value ? startEl.value : Date.now());
+	freeBusyDay = isNaN(when) ? new Date() : when;
+	document.getElementById('freebusy-modal').classList.add('show');
+    loadFreeBusy();
+}
+
+function loadFreeBusy() {
+	const body = document.getElementById('freebusy-body');
+	const label = document.getElementById('freebusy-day');
+	if (!body || !rl.pluginRemoteRequest) return;
+
+	const span = fbWindow(freeBusyDay);
+	if (label) {
+		label.textContent = freeBusyDay.toLocaleDateString(undefined,
+			{ weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+	}
+	body.textContent = 'Asking the server…';
+
+	rl.pluginRemoteRequest((iError, oData) => {
+		const res = oData && oData.Result;
+		if (iError || !res || !res.success) {
+			body.textContent = (res && res.error) || 'The server would not answer.';
+			return;
+		}
+		freeBusyAnswer = res.busy || [];
+		renderFreeBusy(span.from, span.to);
+	}, 'QueryFreeBusy', {
+		Attendees: (document.getElementById('event-attendees') || {}).value || '',
+		Start: span.from.toISOString(),
+		End: span.to.toISOString()
+	});
+}
+
+function renderFreeBusy(from, to) {
+	const body = document.getElementById('freebusy-body');
+	if (!body) return;
+	body.textContent = '';
+
+	const total = to.getTime() - from.getTime();
+	const at = (when) => (100 * (when - from.getTime()) / total) + '%';
+
+	const grid = document.createElement('div');
+	grid.className = 'fb-grid';
+
+	const hours = document.createElement('div');
+	hours.className = 'fb-hours';
+	for (let h = FB_DAY_START; h < FB_DAY_END; ++h) {
+		const cell = document.createElement('span');
+		cell.textContent = String(h).padStart(2, '0');
+		hours.appendChild(cell);
+	}
+	grid.appendChild(hours);
+
+	(freeBusyAnswer || []).forEach(person => {
+		const row = document.createElement('div');
+		row.className = 'fb-row';
+		const who = document.createElement('div');
+		who.className = 'fb-who';
+		who.textContent = person.address;
+		who.title = person.address;
+		const track = document.createElement('div');
+		track.className = 'fb-track';
+
+		if (!person.known) {
+			// Hatched, never blank: "we could not ask" and "they are free" are
+			// answers nobody may confuse.
+			const unknown = document.createElement('div');
+			unknown.className = 'fb-unknown';
+			unknown.title = 'No answer for this address' + (person.status ? ' (' + person.status + ')' : '');
+			track.appendChild(unknown);
+			who.style.opacity = '.6';
+		} else {
+			(person.periods || []).forEach(period => {
+				const start = new Date(period.start), end = new Date(period.end);
+				if (end <= from || start >= to) return;
+				const block = document.createElement('div');
+				block.className = 'fb-busy'
+					+ (/TENTATIVE/.test(period.type || '') ? ' is-tentative' : '');
+				const left = Math.max(start.getTime(), from.getTime());
+				const right = Math.min(end.getTime(), to.getTime());
+				block.style.left = at(left);
+				block.style.width = (100 * (right - left) / total) + '%';
+				block.title = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+					+ ' – ' + end.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+					+ (/TENTATIVE/.test(period.type || '') ? ' (tentative)' : '');
+				track.appendChild(block);
+			});
+		}
+
+		const now = new Date();
+		if (now >= from && now <= to) {
+			const line = document.createElement('div');
+			line.className = 'fb-now';
+			line.style.left = at(now.getTime());
+			track.appendChild(line);
+		}
+
+		row.appendChild(who);
+		row.appendChild(track);
+		grid.appendChild(row);
+	});
+
+	if (!(freeBusyAnswer || []).length) {
+		const none = document.createElement('div');
+		none.className = 'fb-note';
+		none.textContent = 'Nobody to ask about yet — add some guests first.';
+		grid.appendChild(none);
+	}
+	body.appendChild(grid);
+
+	// How long the meeting is, taken from the dialog, so the suggestions are
+	// slots this meeting fits in rather than arbitrary gaps.
+	const startEl = document.getElementById('event-start');
+	const endEl = document.getElementById('event-end');
+	let duration = 3600000;
+	if (startEl && endEl && startEl.value && endEl.value) {
+		const guess = new Date(endEl.value) - new Date(startEl.value);
+		if (guess > 0) duration = guess;
+	}
+
+	const known = (freeBusyAnswer || []).filter(p => p.known);
+	const slots = freeSlots(known, from, to, duration, 8);
+	const box = document.createElement('div');
+	box.className = 'fb-slots';
+	const title = document.createElement('h4');
+	title.textContent = 'Everyone is free at';
+	box.appendChild(title);
+
+	if (!slots.length) {
+		const none = document.createElement('div');
+		none.className = 'fb-note';
+		none.textContent = known.length
+			? 'No gap this long on this day. Try another.'
+			: 'Nothing to suggest until somebody\'s calendar answers.';
+		box.appendChild(none);
+	}
+	slots.forEach(slot => {
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = 'fb-slot';
+		btn.textContent = slot.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+		btn.addEventListener('click', () => takeSlot(slot, duration));
+		box.appendChild(btn);
+	});
+	body.appendChild(box);
+
+	const unknown = (freeBusyAnswer || []).filter(p => !p.known);
+	if (unknown.length) {
+		const note = document.createElement('div');
+		note.className = 'fb-note';
+		note.textContent = unknown.length + ' address'
+			+ (1 === unknown.length ? '' : 'es')
+			+ ' could not be checked — hatched above. They are not counted as free.';
+		body.appendChild(note);
+	}
+}
+
+// Taking a suggestion writes it into the dialog and leaves the saving to the
+// person: a click here has chosen a time, not booked a meeting.
+function takeSlot(start, durationMs) {
+	const startEl = document.getElementById('event-start');
+	const endEl = document.getElementById('event-end');
+	if (!startEl || !endEl) return;
+	const end = new Date(start.getTime() + durationMs);
+	if (document.getElementById('event-allday').checked) {
+		document.getElementById('event-allday').checked = false;
+		toggleTimeInputs(false);
+	}
+	startEl.value = formatDateTimeLocal(start);
+	endEl.value = formatDateTimeLocal(end);
+	document.getElementById('freebusy-modal').classList.remove('show');
 }
 
 /* ------------------------------------------------------------------ *

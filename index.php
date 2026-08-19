@@ -4,7 +4,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 {
 	const
 		NAME     = 'Mailbux CalDAV Auto',
-		VERSION  = '2.14',
+		VERSION  = '2.15',
 		RELEASE  = '2026-08-18',
 		CATEGORY = 'Calendar',
 		DESCRIPTION = 'Auto-configures CalDAV calendar sync with JMAP support - switches per account',
@@ -26,6 +26,7 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 		$this->addJsonHook('ListCalendars', 'DoListCalendars');
 		$this->addJsonHook('CreateCalendar', 'DoCreateCalendar');
 		$this->addJsonHook('UpdateCalendar', 'DoUpdateCalendar');
+		$this->addJsonHook('QueryFreeBusy', 'DoQueryFreeBusy');
 		$this->addJsonHook('GetTasks', 'DoGetTasks');
 		$this->addJsonHook('SaveTask', 'DoSaveTask');
 		$this->addJsonHook('DeleteTask', 'DoDeleteTask');
@@ -2838,6 +2839,233 @@ class CaldavPlugin extends \RainLoop\Plugins\AbstractPlugin
 			$mPassword = (string) $mPassword;
 		}
 		return \is_string($mPassword) ? $mPassword : null;
+	}
+
+	/* --------------------------------------------------------------- *
+	 * Free/busy
+	 *
+	 * "When is everyone free" is the question a calendar exists to answer,
+	 * and the one reason a small business keeps paying for Exchange. The
+	 * server does the work: RFC 6638 4.1 has the organiser POST a
+	 * VFREEBUSY request to their scheduling Outbox, and the server asks
+	 * every attendee's calendar - including ones this account cannot read -
+	 * and answers with a busy list per person. Nothing here reads anybody
+	 * else's events, which is exactly why it is allowed to ask.
+	 * --------------------------------------------------------------- */
+
+	/**
+	 * The scheduling Outbox in this account's calendar home, discovered
+	 * rather than guessed: the name is a server's choice, and Cyrus's
+	 * "Outbox" is not universal.
+	 */
+	private function scheduleOutboxUrl(array $aConfig, string $sPassword) : string
+	{
+		$sBody = '<?xml version="1.0" encoding="utf-8" ?>'
+			. '<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+			. '<D:prop><D:resourcetype /></D:prop></D:propfind>';
+		$aResult = $this->makeCalDAVRequest(\rtrim($aConfig['CalDAVUrl'], '/') . '/', 'PROPFIND',
+			$aConfig['User'], $sPassword, $sBody,
+			['Content-Type: application/xml; charset=utf-8', 'Depth: 1']);
+
+		if (207 === (int) $aResult['code']) {
+			$oDoc = $this->loadDavXml((string) $aResult['body']);
+			if ($oDoc) {
+				$oXPath = new \DOMXPath($oDoc);
+				$oXPath->registerNamespace('D', 'DAV:');
+				$oXPath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');
+				foreach ($oXPath->query('//D:response') as $oResponse) {
+					if ($oXPath->query('.//D:resourcetype/C:schedule-outbox', $oResponse)->length) {
+						$sHref = \trim((string) ($oXPath->query('./D:href', $oResponse)->item(0)->nodeValue ?? ''));
+						if (\strlen($sHref)) {
+							return $this->absoluteDavUrl($aConfig['CalDAVUrl'], $sHref);
+						}
+					}
+				}
+			}
+		}
+		return \rtrim($aConfig['CalDAVUrl'], '/') . '/Outbox/';
+	}
+
+	/**
+	 * The busy periods in a CalDAV schedule-response, per attendee.
+	 *
+	 * Kept apart from the request that fetched it so the shape a server
+	 * actually returns can be tested. A recipient the server could not reach
+	 * is reported as such rather than silently drawn as free - "we do not
+	 * know" and "they are available" are answers a person must not confuse.
+	 */
+	private function parseFreeBusyResponse(string $sXml) : array
+	{
+		$aOut = array();
+		$oDoc = $this->loadDavXml($sXml);
+		if (!$oDoc) {
+			return $aOut;
+		}
+		$oXPath = new \DOMXPath($oDoc);
+		$oXPath->registerNamespace('D', 'DAV:');
+		$oXPath->registerNamespace('C', 'urn:ietf:params:xml:ns:caldav');
+
+		foreach ($oXPath->query('//C:response') as $oResponse) {
+			$sWho = \trim((string) ($oXPath->query('.//C:recipient/D:href', $oResponse)->item(0)->nodeValue
+				?? $oXPath->query('.//C:recipient', $oResponse)->item(0)->nodeValue ?? ''));
+			$sWho = \preg_replace('#^mailto:#i', '', $sWho);
+			if (!\strlen($sWho)) {
+				continue;
+			}
+			// 2.0 is success (RFC 5546 3.6). Anything else means the server
+			// could not answer for this person.
+			$sStatus = \trim((string) ($oXPath->query('.//C:request-status', $oResponse)->item(0)->nodeValue ?? ''));
+			$bKnown  = (bool) \preg_match('/^2\./', $sStatus);
+
+			$aPeriods = array();
+			$sData = (string) ($oXPath->query('.//C:calendar-data', $oResponse)->item(0)->nodeValue ?? '');
+			if ($bKnown && \strlen(\trim($sData))) {
+				$aPeriods = $this->parseFreeBusyPeriods($sData);
+			}
+			$aOut[] = array(
+				'address' => $sWho,
+				'known'   => $bKnown,
+				'status'  => $sStatus,
+				'periods' => $aPeriods
+			);
+		}
+		return $aOut;
+	}
+
+	/**
+	 * The FREEBUSY periods in one VFREEBUSY, as absolute instants.
+	 *
+	 * FBTYPE defaults to BUSY (RFC 5545 3.2.9). FREE periods are dropped: a
+	 * server that states them is saying the same thing as silence, and
+	 * carrying them would have the grid draw availability as if it were an
+	 * appointment.
+	 */
+	private function parseFreeBusyPeriods(string $sIcs) : array
+	{
+		$aPeriods = array();
+		try {
+			$oVCal = \Sabre\VObject\Reader::read($sIcs, \Sabre\VObject\Reader::OPTION_FORGIVING);
+			if (!($oVCal instanceof \Sabre\VObject\Component\VCalendar) || !isset($oVCal->VFREEBUSY)) {
+				return $aPeriods;
+			}
+			foreach ($oVCal->VFREEBUSY as $oFb) {
+				foreach ($oFb->select('FREEBUSY') as $oProperty) {
+					$sType = \strtoupper(\trim((string) ($oProperty['FBTYPE'] ?? 'BUSY')));
+					if ('FREE' === $sType) {
+						continue;
+					}
+					foreach (\explode(',', (string) $oProperty) as $sPeriod) {
+						$aParts = \explode('/', \trim($sPeriod), 2);
+						if (2 !== \count($aParts) || !\strlen($aParts[0])) {
+							continue;
+						}
+						try {
+							$oStart = new \DateTime($aParts[0], new \DateTimeZone('UTC'));
+							// A period is either two instants or an instant and
+							// a duration (RFC 5545 3.3.9); both are legal here.
+							$oEnd = ('P' === \strtoupper(\substr($aParts[1], 0, 1)))
+								? (clone $oStart)->add(\Sabre\VObject\DateTimeParser::parseDuration($aParts[1]))
+								: new \DateTime($aParts[1], new \DateTimeZone('UTC'));
+						} catch (\Throwable $oException) {
+							continue;
+						}
+						if ($oEnd <= $oStart) {
+							continue;
+						}
+						$aPeriods[] = array(
+							'start' => $oStart->format('c'),
+							'end'   => $oEnd->format('c'),
+							'type'  => $sType
+						);
+					}
+				}
+			}
+		} catch (\Throwable $oException) {
+			\SnappyMail\Log::notice('CalDAV', 'free/busy parse failed: ' . $oException->getMessage());
+		}
+		\usort($aPeriods, function ($a, $b) { return \strcmp($a['start'], $b['start']); });
+		return $aPeriods;
+	}
+
+	/**
+	 * Ask the server when a list of people are busy.
+	 */
+	public function DoQueryFreeBusy() : array
+	{
+		try {
+			$oAccount = $this->Manager()->Actions()->getAccountFromToken();
+			$aConfig  = $oAccount ? $this->getCalendarConfig($oAccount) : null;
+			if (!$aConfig) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'busy' => [],
+					'error' => 'Calendar not configured']);
+			}
+			$sPassword = $this->calendarPassword($aConfig);
+			if (null === $sPassword) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'busy' => [],
+					'error' => 'Cannot access encryption key']);
+			}
+
+			$aWho = $this->parseAttendees((string) $this->jsonParam('Attendees', ''));
+			$sSelf = $oAccount->Email();
+			// The organiser's own time counts: proposing a slot they are
+			// already booked in is the commonest way this feature is useless.
+			if (!\in_array(\strtolower($sSelf), \array_map('strtolower', $aWho), true)) {
+				\array_unshift($aWho, $sSelf);
+			}
+			$aWho = \array_slice($aWho, 0, 50);
+			if (!$aWho) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'busy' => [],
+					'error' => 'Nobody to ask about']);
+			}
+
+			try {
+				$oUtc   = new \DateTimeZone('UTC');
+				$oStart = new \DateTime((string) $this->jsonParam('Start', 'now'), $oUtc);
+				$oEnd   = new \DateTime((string) $this->jsonParam('End', '+7 days'), $oUtc);
+			} catch (\Throwable $oException) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'busy' => [],
+					'error' => 'Unreadable dates']);
+			}
+			if ($oEnd <= $oStart) {
+				$oEnd = (clone $oStart)->modify('+7 days');
+			}
+			// A window nobody needs is a query every attendee's server has to
+			// answer, so it is bounded here rather than trusted.
+			if (86400 * 62 < $oEnd->getTimestamp() - $oStart->getTimestamp()) {
+				$oEnd = (clone $oStart)->modify('+62 days');
+			}
+
+			$sIcs = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+				. "PRODID:-//SnappyMail//CalDAV Plugin//EN\r\nMETHOD:REQUEST\r\n"
+				. "BEGIN:VFREEBUSY\r\n"
+				. 'UID:' . \uniqid('fb-') . '@' . $aConfig['User'] . "\r\n"
+				. 'DTSTAMP:' . \gmdate('Ymd\THis\Z') . "\r\n"
+				. 'DTSTART:' . $oStart->format('Ymd\THis\Z') . "\r\n"
+				. 'DTEND:' . $oEnd->format('Ymd\THis\Z') . "\r\n"
+				. 'ORGANIZER:mailto:' . $sSelf . "\r\n";
+			foreach ($aWho as $sAddress) {
+				$sIcs .= 'ATTENDEE:mailto:' . $sAddress . "\r\n";
+			}
+			$sIcs .= "END:VFREEBUSY\r\nEND:VCALENDAR\r\n";
+
+			$aResult = $this->makeCalDAVRequest($this->scheduleOutboxUrl($aConfig, $sPassword), 'POST',
+				$aConfig['User'], $sPassword, $sIcs,
+				['Content-Type: text/calendar; charset=utf-8']);
+
+			if (!\in_array((int) $aResult['code'], array(200, 207), true)) {
+				return $this->jsonResponse(__FUNCTION__, ['success' => false, 'busy' => [],
+					'error' => 'The server would not answer the availability request ('
+						. $aResult['code'] . '). Scheduling may not be enabled.']);
+			}
+
+			return $this->jsonResponse(__FUNCTION__, ['success' => true,
+				'busy'  => $this->parseFreeBusyResponse((string) $aResult['body']),
+				'start' => $oStart->format('c'),
+				'end'   => $oEnd->format('c')]);
+		} catch (\Exception $oException) {
+			return $this->jsonResponse(__FUNCTION__, ['success' => false, 'busy' => [],
+				'error' => $oException->getMessage()]);
+		}
 	}
 
 	/* --------------------------------------------------------------- *
